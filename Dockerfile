@@ -19,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NETWORK_STATS_FRONTEND_DIR=/app/frontend/dist
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends iputils-ping && \
+    apt-get install -y --no-install-recommends iputils-ping gosu && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --system app && \
     useradd --system --gid app --home-dir /app app && \
@@ -45,7 +45,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)" || exit 1
 
-USER app
+USER root
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
