@@ -19,7 +19,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NETWORK_STATS_FRONTEND_DIR=/app/frontend/dist
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends iputils-ping gosu && \
+    apt-get install -y --no-install-recommends iputils-ping gosu libcap2-bin && \
+    setcap cap_net_raw+ep /usr/bin/ping && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --system app && \
     useradd --system --gid app --home-dir /app app && \
