@@ -185,6 +185,7 @@ class DiscoveryResultResponse(BaseModel):
     icmp_latency_ms: float | None = None
     icmp_is_available: bool | None = None
     icmp_error: str | None = None
+    is_this_device: bool = False
     open_ports: list[int]
     discovered_at: datetime
 

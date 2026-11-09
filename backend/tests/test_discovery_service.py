@@ -48,6 +48,10 @@ def mock_icmp_probe():
             new_callable=AsyncMock,
             return_value={},
         ),
+        patch(
+            "app.services.discovery.get_local_interface_addresses",
+            return_value={},
+        ),
     ):
         yield mock
 
@@ -144,6 +148,7 @@ async def test_execute_discovery_scan_persists_results(session_factory):
         assert results[0].icmp_latency_ms == 1.25
         assert results[0].icmp_is_available is True
         assert results[0].icmp_error is None
+        assert results[0].is_this_device is False
         assert results[0].open_ports == [22, 80]
         assert results[1].ip_address == "192.168.50.20"
         assert results[1].response_time_ms == 4.2
@@ -731,3 +736,50 @@ async def test_icmp_only_host_is_discovered_without_open_tcp_ports(session_facto
         assert result.open_ports == []
         assert result.device_id is None
         assert db.scalar(select(Device)) is None
+
+
+@pytest.mark.parametrize("local_mac", ["aa:bb:cc:dd:ee:fa", None])
+@pytest.mark.asyncio
+async def test_discovery_includes_scanner_local_interface(session_factory, local_mac):
+    local_ip = "192.168.50.250"
+
+    with session_factory() as db:
+        scan = create_discovery_scan(db, "192.168.50.0/24")
+        scan_id = scan.id
+
+        with (
+            patch(
+                "app.services.discovery.discover_tcp_hosts",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "app.services.discovery.get_local_interface_addresses",
+                return_value={local_ip: local_mac},
+            ),
+            patch(
+                "app.services.discovery.lookup_mac_address",
+                return_value=None,
+            ) as mac_lookup,
+            patch(
+                "app.services.discovery.lookup_hostname",
+                return_value=None,
+            ),
+        ):
+            completed = await execute_discovery_scan(db, scan_id)
+
+        result = db.scalar(
+            select(DiscoveryResult).where(
+                DiscoveryResult.scan_id == scan_id
+            )
+        )
+
+        assert completed.status == "completed"
+        assert completed.devices_found == 1
+        assert result is not None
+        assert result.ip_address == local_ip
+        assert result.mac_address == local_mac
+        assert result.is_this_device is True
+        assert result.device_id is None
+        assert db.scalar(select(Device)) is None
+        mac_lookup.assert_not_called()

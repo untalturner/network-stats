@@ -11,6 +11,7 @@ from app.discovery import (
     discover_tcp_hosts,
     discover_mdns_hosts,
     discover_ssdp_hosts,
+    get_local_interface_addresses,
     lookup_hostname,
     lookup_mac_address,
     validate_network,
@@ -171,6 +172,8 @@ async def execute_discovery_scan(
             if isinstance(parsed_ip, ipaddress.IPv4Address) and parsed_ip in network:
                 ssdp_hosts_by_ip[str(parsed_ip)] = headers
 
+        local_interfaces = get_local_interface_addresses(scan.network_cidr)
+
         discovered_ips = set(tcp_hosts_by_ip)
         discovered_ips.update(
             ip_address
@@ -178,6 +181,14 @@ async def execute_discovery_scan(
             if hasattr(result, "is_available") and result.is_available
         )
         discovered_ips.update(ssdp_hosts_by_ip)
+
+        # Include the scanner itself when one of its visible interfaces
+        # belongs to the subnet being scanned.
+        discovered_ips.update(
+            ip_address
+            for ip_address in local_interfaces
+            if ipaddress.ip_address(ip_address) in network
+        )
 
         hosts = []
         for ip_address in sorted(
@@ -220,7 +231,10 @@ async def execute_discovery_scan(
                         )
                         return None
 
-                mac_address = await lookup(lookup_mac_address)
+                is_scanner = host.ip_address in local_interfaces
+                mac_address = local_interfaces.get(host.ip_address)
+                if not is_scanner and not mac_address:
+                    mac_address = await lookup(lookup_mac_address)
                 hostname = mdns_hostnames.get(host.ip_address)
                 if not hostname:
                     hostname = await lookup(lookup_hostname)
@@ -330,6 +344,7 @@ async def execute_discovery_scan(
                         else None
                     ),
                     open_ports=list(host.open_ports),
+                    is_this_device=host.ip_address in local_interfaces,
                 )
             )
 

@@ -35,6 +35,7 @@ type DiscoveryResult = {
   icmp_latency_ms: number | null;
   icmp_is_available: boolean | null;
   icmp_error: string | null;
+  is_this_device: boolean;
   open_ports: number[];
   discovered_at: string;
 };
@@ -565,6 +566,9 @@ function DiscoveryPage() {
                       <strong>{result.device_name || result.hostname || result.ip_address}</strong>
                       <span>{result.ip_address} · Result #{result.id}</span>
                     </div>
+                    {result.is_this_device && (
+                      <span className="discovery-status running">This device</span>
+                    )}
                     {result.device_id !== null ? (
                       <span className="discovery-status completed">Enrolled · Device #{result.device_id}</span>
                     ) : (

@@ -178,6 +178,9 @@ class DiscoveryResult(Base):
     icmp_latency_ms: Mapped[float | None] = mapped_column(Float)
     icmp_is_available: Mapped[bool | None] = mapped_column(Boolean)
     icmp_error: Mapped[str | None] = mapped_column(Text)
+    is_this_device: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     open_ports: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
     discovered_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False

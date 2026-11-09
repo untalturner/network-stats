@@ -1,12 +1,13 @@
 import asyncio
-import os
 import ipaddress
 import logging
+import psutil
 import re
 import socket
+import subprocess
+import sys
 import struct
 import time
-from pathlib import Path
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,6 @@ DEFAULT_DISCOVERY_PORTS = (
 MAX_CONCURRENT_CONNECTIONS = 100
 DEFAULT_TIMEOUT_SECONDS = 0.5
 MAX_NETWORK_ADDRESSES = 256
-ARP_TABLE_PATH = os.getenv("NETWORK_STATS_ARP_TABLE_PATH", "/proc/net/arp")
 MAC_ADDRESS_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 
 
@@ -142,26 +142,121 @@ async def discover_tcp_hosts(
 
 
 
-def lookup_mac_address(ip_address: str) -> str | None:
-    """Return a complete MAC address from the Linux ARP cache, if available."""
+def get_local_interface_addresses(
+    network_cidr: str,
+) -> dict[str, str | None]:
+    """Return the routed local IPv4 address and its optional MAC address."""
     try:
-        lines = Path(ARP_TABLE_PATH).read_text(encoding="ascii").splitlines()[1:]
-    except (OSError, UnicodeError):
+        network = validate_network(network_cidr)
+        target = next(network.hosts(), network.network_address)
+
+        # Let the operating system's routing table select the interface.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+            route_socket.connect((str(target), 9))
+            local_ip = route_socket.getsockname()[0]
+
+        if not local_ip or ipaddress.ip_address(local_ip).is_unspecified:
+            return {}
+
+        # MAC discovery is optional; the routed IP is sufficient to identify
+        # the scanner even when interface enumeration is unavailable.
+        try:
+            interfaces = psutil.net_if_addrs()
+        except Exception:
+            logger.debug("Unable to enumerate network interfaces", exc_info=True)
+            return {local_ip: None}
+
+        mac_address = None
+        link_layer_families = {
+            getattr(psutil, "AF_LINK", object()),
+            getattr(socket, "AF_PACKET", object()),
+        }
+
+        for addresses in interfaces.values():
+            ipv4_addresses = [
+                address.address
+                for address in addresses
+                if address.family == socket.AF_INET
+            ]
+            if local_ip not in ipv4_addresses:
+                continue
+
+            for address in addresses:
+                if address.family not in link_layer_families:
+                    continue
+
+                # Normalise Windows-style hyphenated MAC addresses.
+                candidate = address.address.lower().replace("-", ":")
+                if (
+                    MAC_ADDRESS_PATTERN.fullmatch(candidate)
+                    and candidate not in {
+                        "00:00:00:00:00:00",
+                        "02:00:00:00:00:00",
+                    }
+                ):
+                    mac_address = candidate
+                    break
+            break
+
+        return {local_ip: mac_address}
+
+    except (OSError, ValueError):
+        logger.debug(
+            "Unable to identify the local interface for %s",
+            network_cidr,
+            exc_info=True,
+        )
+        return {}
+
+def lookup_mac_address(ip_address: str) -> str | None:
+    """Look up an IPv4 neighbour MAC using the host OS networking tools."""
+    try:
+        target_ip = str(ipaddress.IPv4Address(ip_address))
+    except ipaddress.AddressValueError:
         return None
 
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 4 or fields[0] != ip_address:
+    commands = []
+    if sys.platform.startswith("linux"):
+        commands.append(["ip", "neigh", "show", target_ip])
+
+    # arp is available on macOS and Windows, and is a fallback on Linux.
+    commands.append(["arp", "-a"])
+
+    mac_pattern = re.compile(
+        r"(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])",
+        re.IGNORECASE,
+    )
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             continue
 
-        mac_address = fields[3]
-        if (
-            len(fields) >= 3
-            and fields[2] != "0x0"
-            and MAC_ADDRESS_PATTERN.fullmatch(mac_address)
-            and mac_address.lower() != "00:00:00:00:00:00"
-        ):
-            return mac_address.lower()
+        if result.returncode != 0:
+            continue
+
+        for line in result.stdout.splitlines():
+            # Require the exact requested IP and MAC to occur on the same line.
+            if not re.search(
+                rf"(?<![0-9.]){re.escape(target_ip)}(?![0-9.])",
+                line,
+            ):
+                continue
+
+            match = mac_pattern.search(line)
+            if not match:
+                continue
+
+            mac_address = match.group(0).replace("-", ":").lower()
+            if mac_address != "00:00:00:00:00:00":
+                return mac_address
 
     return None
 

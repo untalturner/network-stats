@@ -1,33 +1,111 @@
+import subprocess
 from unittest.mock import patch
 
 from app.discovery import lookup_hostname, lookup_mac_address
 
 
-def test_lookup_mac_address_returns_complete_arp_entry(tmp_path):
-    arp_file = tmp_path / "arp"
-    arp_file.write_text(
-        "IP address       HW type     Flags       HW address            Mask     Device\n"
-        "192.168.50.10    0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n"
+def _command_result(stdout="", returncode=0):
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=returncode,
+        stdout=stdout,
+        stderr="",
     )
 
-    with patch("app.discovery.ARP_TABLE_PATH", str(arp_file)):
+
+def test_lookup_mac_address_parses_linux_ip_neighbour_output():
+    output = (
+        "192.168.50.10 dev eth0 lladdr AA:BB:CC:DD:EE:FF "
+        "REACHABLE\\n"
+    )
+    with (
+        patch("app.discovery.sys.platform", "linux"),
+        patch("app.discovery.subprocess.run", return_value=_command_result(output)) as run,
+    ):
+        assert lookup_mac_address("192.168.50.10") == "aa:bb:cc:dd:ee:ff"
+
+    assert run.call_args.args[0] == ["ip", "neigh", "show", "192.168.50.10"]
+
+
+def test_lookup_mac_address_falls_back_to_arp_on_linux():
+    output = "? (192.168.50.10) at aa:bb:cc:dd:ee:ff on en0\\n"
+    with (
+        patch("app.discovery.sys.platform", "linux"),
+        patch(
+            "app.discovery.subprocess.run",
+            side_effect=[
+                _command_result(returncode=1),
+                _command_result(output),
+            ],
+        ) as run,
+    ):
+        assert lookup_mac_address("192.168.50.10") == "aa:bb:cc:dd:ee:ff"
+
+    assert run.call_count == 2
+
+
+def test_lookup_mac_address_parses_macos_arp_output():
+    output = "? (192.168.50.10) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]\\n"
+    with (
+        patch("app.discovery.sys.platform", "darwin"),
+        patch("app.discovery.subprocess.run", return_value=_command_result(output)) as run,
+    ):
+        assert lookup_mac_address("192.168.50.10") == "aa:bb:cc:dd:ee:ff"
+
+    assert run.call_args.args[0] == ["arp", "-a"]
+
+
+def test_lookup_mac_address_parses_windows_arp_output():
+    output = (
+        "Interface: 192.168.50.2 --- 0x9\\n"
+        "  192.168.50.10          aa-bb-cc-dd-ee-ff     dynamic\\n"
+    )
+    with (
+        patch("app.discovery.sys.platform", "win32"),
+        patch("app.discovery.subprocess.run", return_value=_command_result(output)),
+    ):
         assert lookup_mac_address("192.168.50.10") == "aa:bb:cc:dd:ee:ff"
 
 
-def test_lookup_mac_address_ignores_incomplete_entries(tmp_path):
-    arp_file = tmp_path / "arp"
-    arp_file.write_text(
-        "IP address       HW type     Flags       HW address            Mask     Device\n"
-        "192.168.50.10    0x1         0x0         00:00:00:00:00:00     *        eth0\n"
+def test_lookup_mac_address_rejects_incomplete_or_zero_entries():
+    output = (
+        "? (192.168.50.10) at (incomplete) on en0\\n"
+        "? (192.168.50.11) at 00:00:00:00:00:00 on en0\\n"
     )
+    with (
+        patch("app.discovery.sys.platform", "darwin"),
+        patch("app.discovery.subprocess.run", return_value=_command_result(output)),
+    ):
+        assert lookup_mac_address("192.168.50.10") is None
+        assert lookup_mac_address("192.168.50.11") is None
 
-    with patch("app.discovery.ARP_TABLE_PATH", str(arp_file)):
+
+def test_lookup_mac_address_does_not_match_another_ip():
+    output = "? (192.168.50.11) at aa:bb:cc:dd:ee:ff on en0\\n"
+    with (
+        patch("app.discovery.sys.platform", "darwin"),
+        patch("app.discovery.subprocess.run", return_value=_command_result(output)),
+    ):
         assert lookup_mac_address("192.168.50.10") is None
 
 
-def test_lookup_mac_address_returns_none_when_table_unavailable():
-    with patch("app.discovery.ARP_TABLE_PATH", "/nonexistent/arp"):
+def test_lookup_mac_address_handles_missing_commands():
+    with (
+        patch("app.discovery.sys.platform", "linux"),
+        patch(
+            "app.discovery.subprocess.run",
+            side_effect=FileNotFoundError("command unavailable"),
+        ),
+    ):
         assert lookup_mac_address("192.168.50.10") is None
+
+
+def test_lookup_mac_address_rejects_invalid_and_ipv6_addresses():
+    with patch("app.discovery.subprocess.run") as run:
+        assert lookup_mac_address("not-an-ip") is None
+        assert lookup_mac_address("2001:db8::1") is None
+
+    run.assert_not_called()
 
 
 def test_lookup_hostname_returns_reverse_dns_name():
@@ -44,28 +122,6 @@ def test_lookup_hostname_returns_none_when_reverse_dns_fails():
         side_effect=OSError("No reverse DNS record"),
     ):
         assert lookup_hostname("192.168.50.1") is None
-
-
-def test_lookup_mac_address_ignores_malformed_entries(tmp_path):
-    arp_file = tmp_path / "arp"
-    arp_file.write_text(
-        "IP address       HW type     Flags       HW address            Mask     Device\n"
-        "192.168.50.10    0x1         0x2         invalid-mac            *        eth0\n"
-    )
-
-    with patch("app.discovery.ARP_TABLE_PATH", str(arp_file)):
-        assert lookup_mac_address("192.168.50.10") is None
-
-
-def test_lookup_mac_address_does_not_return_another_ip_entry(tmp_path):
-    arp_file = tmp_path / "arp"
-    arp_file.write_text(
-        "IP address       HW type     Flags       HW address            Mask     Device\n"
-        "192.168.50.11    0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n"
-    )
-
-    with patch("app.discovery.ARP_TABLE_PATH", str(arp_file)):
-        assert lookup_mac_address("192.168.50.10") is None
 
 
 def _dns_name(name):

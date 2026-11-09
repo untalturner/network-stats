@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from app import discovery
 from app.discovery import discover_tcp_hosts, validate_network
 
 
@@ -91,3 +92,173 @@ async def test_discovery_rejects_invalid_concurrency():
 async def test_discovery_rejects_invalid_timeout():
     with pytest.raises(ValueError, match="timeout_seconds"):
         await discover_tcp_hosts("127.0.0.1/32", timeout_seconds=0)
+
+
+
+def test_local_interface_detection_uses_routed_interface(monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def connect(self, address):
+            assert address == ("192.168.50.1", 9)
+
+        def getsockname(self):
+            return ("192.168.50.250", 12345)
+
+    monkeypatch.setattr(
+        discovery.socket,
+        "socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+
+    monkeypatch.setattr(
+        discovery.psutil,
+        "net_if_addrs",
+        lambda: {
+            "physical-interface": [
+                type("Address", (), {
+                    "family": discovery.socket.AF_INET,
+                    "address": "192.168.50.250",
+                })(),
+                type("Address", (), {
+                    "family": discovery.psutil.AF_LINK,
+                    "address": "aa:bb:cc:dd:ee:ff",
+                })(),
+            ],
+            "unrelated-bridge": [
+                type("Address", (), {
+                    "family": discovery.socket.AF_INET,
+                    "address": "172.16.0.1",
+                })(),
+                type("Address", (), {
+                    "family": discovery.psutil.AF_LINK,
+                    "address": "11:22:33:44:55:66",
+                })(),
+            ],
+        },
+    )
+
+    assert discovery.get_local_interface_addresses(
+        "192.168.50.0/24"
+    ) == {
+        "192.168.50.250": "aa:bb:cc:dd:ee:ff"
+    }
+
+
+def test_local_interface_detection_returns_empty_when_route_fails(monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def connect(self, address):
+            raise OSError("No route")
+
+    monkeypatch.setattr(
+        discovery.socket,
+        "socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+
+    assert discovery.get_local_interface_addresses(
+        "192.168.50.0/24"
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    "mac_address",
+    [None, "02:00:00:00:00:00"],
+)
+def test_local_interface_detection_returns_local_ip_without_mac(
+    monkeypatch, mac_address
+):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def connect(self, address):
+            pass
+
+        def getsockname(self):
+            return ("192.168.50.250", 12345)
+
+    monkeypatch.setattr(
+        discovery.socket,
+        "socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+
+    addresses = [
+        type("Address", (), {
+            "family": discovery.socket.AF_INET,
+            "address": "192.168.50.250",
+        })(),
+    ]
+
+    if mac_address is not None:
+        addresses.append(
+            type("Address", (), {
+                "family": discovery.psutil.AF_LINK,
+                "address": mac_address,
+            })()
+        )
+
+    monkeypatch.setattr(
+        discovery.psutil,
+        "net_if_addrs",
+        lambda: {"interface": addresses},
+    )
+
+    assert discovery.get_local_interface_addresses(
+        "192.168.50.0/24"
+    ) == {"192.168.50.250": None}
+
+
+def test_local_interface_detection_normalises_windows_mac(monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def connect(self, address):
+            pass
+
+        def getsockname(self):
+            return ("192.168.50.250", 12345)
+
+    monkeypatch.setattr(
+        discovery.socket,
+        "socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+    monkeypatch.setattr(
+        discovery.psutil,
+        "net_if_addrs",
+        lambda: {
+            "interface": [
+                type("Address", (), {
+                    "family": discovery.socket.AF_INET,
+                    "address": "192.168.50.250",
+                })(),
+                type("Address", (), {
+                    "family": discovery.psutil.AF_LINK,
+                    "address": "AA-BB-CC-DD-EE-FF",
+                })(),
+            ],
+        },
+    )
+
+    assert discovery.get_local_interface_addresses(
+        "192.168.50.0/24"
+    ) == {"192.168.50.250": "aa:bb:cc:dd:ee:ff"}
