@@ -2,8 +2,10 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -58,6 +60,97 @@ class MonitoringScheduler:
             )
 
         self.job_handlers[normalized_type] = handler
+
+    @staticmethod
+    def _schedule_datetime(value: datetime | None) -> datetime | None:
+        """Interpret stored naive datetimes as UTC for scheduler triggers."""
+        if value is None:
+            return None
+
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def build_trigger(
+        cls,
+        job: ScheduledJob,
+    ) -> IntervalTrigger | CronTrigger:
+        """Build an APScheduler trigger from a persisted schedule definition."""
+        timezone_name = (job.timezone or "UTC").strip()
+
+        try:
+            job_timezone = ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"Unknown schedule timezone: {timezone_name!r}"
+            ) from exc
+
+        start_date = cls._schedule_datetime(job.start_at)
+        end_date = cls._schedule_datetime(job.end_at)
+
+        if start_date is not None and end_date is not None:
+            if end_date <= start_date:
+                raise ValueError("Schedule end_at must be later than start_at")
+
+        if job.schedule_type == "interval":
+            if job.interval_seconds is None or job.interval_seconds < 1:
+                raise ValueError(
+                    "Interval schedules require interval_seconds of at least 1"
+                )
+
+            return IntervalTrigger(
+                seconds=job.interval_seconds,
+                timezone=job_timezone,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        if job.schedule_type == "cron":
+            expression = (job.cron_expression or "").strip()
+            fields = expression.split()
+
+            if len(fields) != 5:
+                raise ValueError(
+                    "Cron expressions must contain exactly five fields "
+                    "(minute hour day month day_of_week)"
+                )
+
+            return CronTrigger(
+                minute=fields[0],
+                hour=fields[1],
+                day=fields[2],
+                month=fields[3],
+                day_of_week=fields[4],
+                timezone=job_timezone,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        raise ValueError(
+            f"Unsupported schedule type: {job.schedule_type!r}"
+        )
+
+    @staticmethod
+    def _trigger_signature(trigger: IntervalTrigger | CronTrigger) -> tuple:
+        """Return stable trigger configuration for reconciliation."""
+        if isinstance(trigger, IntervalTrigger):
+            return (
+                "interval",
+                trigger.interval,
+                str(trigger.timezone),
+                trigger.start_date,
+                trigger.end_date,
+            )
+
+        return (
+            "cron",
+            tuple((field.name, str(field)) for field in trigger.fields),
+            str(trigger.timezone),
+            trigger.start_date,
+            trigger.end_date,
+        )
 
     async def _execute_connectivity_probe(
         self,
@@ -280,8 +373,13 @@ class MonitoringScheduler:
                     db.add(job)
                 else:
                     job.name = f"Probe target: {target.name}"
-                    job.interval_seconds = target.interval_seconds
-                    job.is_enabled = target.is_enabled
+
+                    # Uncustomized jobs retain the legacy behaviour of
+                    # inheriting their interval and enabled state from
+                    # the associated monitoring target.
+                    if not job.schedule_is_customized:
+                        job.interval_seconds = target.interval_seconds
+                        job.is_enabled = target.is_enabled
 
             for job in scheduled_jobs:
                 if job.target_id not in targets_by_id:
@@ -296,7 +394,14 @@ class MonitoringScheduler:
             ).all()
 
             desired_jobs = {
-                job.target_id: (job.id, job.interval_seconds)
+                job.target_id: (
+                    job.id,
+                    self.build_trigger(job),
+                    (
+                        not job.schedule_is_customized
+                        and job.schedule_type == "interval"
+                    ),
+                )
                 for job in persistent_jobs
                 if (
                     job.target_id in targets_by_id
@@ -316,15 +421,18 @@ class MonitoringScheduler:
             if target_id not in desired_jobs:
                 self.scheduler.remove_job(job_id)
 
-        for target_id, (persistent_job_id, interval_seconds) in desired_jobs.items():
+        for target_id, (
+            persistent_job_id,
+            trigger,
+            run_immediately,
+        ) in desired_jobs.items():
             job_id = f"target-{target_id}"
             existing_job = self.scheduler.get_job(job_id)
 
             if existing_job is not None:
-                current_interval = existing_job.trigger.interval.total_seconds()
-
                 if (
-                    current_interval == interval_seconds
+                    self._trigger_signature(existing_job.trigger)
+                    == self._trigger_signature(trigger)
                     and existing_job.args == [persistent_job_id]
                 ):
                     continue
@@ -333,14 +441,21 @@ class MonitoringScheduler:
 
             self.scheduler.add_job(
                 self._run_job,
-                trigger=IntervalTrigger(
-                    seconds=interval_seconds,
-                    timezone="UTC",
-                ),
+                trigger=trigger,
                 id=job_id,
                 args=[persistent_job_id],
                 name=f"Probe target {target_id}",
-                next_run_time=utc_now(),
+                # Preserve the legacy immediate first probe only for
+                # inherited interval jobs. Custom intervals and cron jobs
+                # must honour their trigger's calculated next fire time.
+                next_run_time=(
+                    utc_now()
+                    if run_immediately
+                    else trigger.get_next_fire_time(
+                        None,
+                        datetime.now(trigger.timezone),
+                    )
+                ),
                 max_instances=1,
                 coalesce=True,
                 misfire_grace_time=30,

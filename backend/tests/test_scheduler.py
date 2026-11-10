@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -234,3 +234,260 @@ async def test_scheduler_runs_probes_automatically(scheduler):
     assert len(measurements) >= 2
     assert all(measurement.is_available for measurement in measurements)
     assert all(measurement.latency_ms == 15.2 for measurement in measurements)
+
+
+def test_build_interval_trigger_uses_timezone_and_date_bounds(scheduler):
+    from zoneinfo import ZoneInfo
+
+    job = models.ScheduledJob(
+        name="Bounded interval",
+        job_type="example",
+        interval_seconds=60,
+        schedule_type="interval",
+        timezone="Europe/Madrid",
+        start_at=datetime(2026, 11, 10, 8, 0, 0),
+        end_at=datetime(2026, 11, 11, 8, 0, 0),
+    )
+
+    trigger = scheduler.build_trigger(job)
+
+    assert trigger.interval.total_seconds() == 60
+    assert trigger.timezone == ZoneInfo("Europe/Madrid")
+    assert trigger.start_date.astimezone(timezone.utc) == datetime(
+        2026, 11, 10, 8, 0, 0, tzinfo=timezone.utc
+    )
+    assert trigger.end_date.astimezone(timezone.utc) == datetime(
+        2026, 11, 11, 8, 0, 0, tzinfo=timezone.utc
+    )
+
+
+def test_build_cron_trigger_supports_weekdays_and_timezone(scheduler):
+    from zoneinfo import ZoneInfo
+
+    job = models.ScheduledJob(
+        name="Weekday morning task",
+        job_type="example",
+        schedule_type="cron",
+        cron_expression="0 9 * * mon-fri",
+        timezone="Europe/Madrid",
+    )
+
+    trigger = scheduler.build_trigger(job)
+
+    assert trigger.timezone == ZoneInfo("Europe/Madrid")
+    assert any(
+        field.name == "day_of_week" and str(field) == "mon-fri"
+        for field in trigger.fields
+    )
+
+    now = datetime(
+        2026, 11, 10, 8, 0, 0,
+        tzinfo=ZoneInfo("Europe/Madrid"),
+    )
+    next_run = trigger.get_next_fire_time(None, now)
+
+    assert next_run is not None
+    assert next_run.hour == 9
+    assert next_run.minute == 0
+
+
+def test_build_cron_trigger_rejects_invalid_field_count(scheduler):
+    job = models.ScheduledJob(
+        name="Invalid cron",
+        job_type="example",
+        schedule_type="cron",
+        cron_expression="0 9 * *",
+        timezone="UTC",
+    )
+
+    with pytest.raises(ValueError, match="exactly five fields"):
+        scheduler.build_trigger(job)
+
+
+def test_build_trigger_rejects_unknown_timezone(scheduler):
+    job = models.ScheduledJob(
+        name="Invalid timezone",
+        job_type="example",
+        interval_seconds=60,
+        schedule_type="interval",
+        timezone="Not/A_Real_Timezone",
+    )
+
+    with pytest.raises(ValueError, match="Unknown schedule timezone"):
+        scheduler.build_trigger(job)
+
+
+def test_build_trigger_rejects_invalid_date_range(scheduler):
+    job = models.ScheduledJob(
+        name="Invalid date range",
+        job_type="example",
+        interval_seconds=60,
+        schedule_type="interval",
+        timezone="UTC",
+        start_at=datetime(2026, 11, 11, 8, 0, 0),
+        end_at=datetime(2026, 11, 10, 8, 0, 0),
+    )
+
+    with pytest.raises(ValueError, match="later than start_at"):
+        scheduler.build_trigger(job)
+
+
+def test_reconcile_preserves_custom_interval_when_target_changes(scheduler):
+    target_id = create_target(scheduler.session_factory, "Custom schedule target")
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        target = db.get(models.MonitoringTarget, target_id)
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.schedule_is_customized = True
+        job.interval_seconds = 300
+        target.interval_seconds = 60
+        db.commit()
+
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        assert job.schedule_is_customized is True
+        assert job.interval_seconds == 300
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.trigger.interval.total_seconds() == 300
+
+
+def test_reconcile_preserves_custom_job_enabled_state(scheduler):
+    target_id = create_target(scheduler.session_factory, "Custom enabled target")
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        target = db.get(models.MonitoringTarget, target_id)
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.schedule_is_customized = True
+        job.is_enabled = False
+        target.interval_seconds = 120
+        db.commit()
+
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        assert job.schedule_is_customized is True
+        assert job.is_enabled is False
+        assert job.interval_seconds == 30
+
+    assert scheduler.scheduler.get_job(f"target-{target_id}") is None
+
+
+def test_disabled_target_blocks_custom_schedule_without_overwriting_it(scheduler):
+    target_id = create_target(scheduler.session_factory, "Custom target gate")
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        target = db.get(models.MonitoringTarget, target_id)
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.schedule_is_customized = True
+        job.interval_seconds = 300
+        target.is_enabled = False
+        db.commit()
+
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        assert job.schedule_is_customized is True
+        assert job.is_enabled is True
+        assert job.interval_seconds == 300
+
+    assert scheduler.scheduler.get_job(f"target-{target_id}") is None
+
+    with scheduler.session_factory() as db:
+        target = db.get(models.MonitoringTarget, target_id)
+        target.is_enabled = True
+        db.commit()
+
+    scheduler.reconcile()
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.trigger.interval.total_seconds() == 300
+
+
+def test_custom_interval_respects_future_start_date(scheduler):
+    from datetime import timedelta, timezone
+
+    target_id = create_target(
+        scheduler.session_factory,
+        "Future custom interval",
+    )
+    scheduler.reconcile()
+
+    start_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(
+            target_id=target_id
+        ).one()
+        job.schedule_is_customized = True
+        job.interval_seconds = 300
+        job.start_at = start_at
+        db.commit()
+
+    scheduler.reconcile()
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.next_run_time is not None
+    assert runtime_job.next_run_time.astimezone(timezone.utc) >= start_at.replace(
+        tzinfo=timezone.utc
+    )
+
+
+def test_custom_cron_uses_next_cron_fire_time(scheduler):
+    from zoneinfo import ZoneInfo
+
+    target_id = create_target(
+        scheduler.session_factory,
+        "Custom cron schedule",
+    )
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(
+            target_id=target_id
+        ).one()
+        job.schedule_is_customized = True
+        job.schedule_type = "cron"
+        job.interval_seconds = None
+        job.cron_expression = "0 9 * * mon-fri"
+        job.timezone = "Europe/Madrid"
+        db.commit()
+
+    scheduler.reconcile()
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.next_run_time is not None
+
+    local_next_run = runtime_job.next_run_time.astimezone(
+        ZoneInfo("Europe/Madrid")
+    )
+    assert local_next_run.hour == 9
+    assert local_next_run.minute == 0
+    assert local_next_run.weekday() < 5
+
+
+def test_inherited_interval_keeps_immediate_first_probe(scheduler):
+    target_id = create_target(
+        scheduler.session_factory,
+        "Inherited immediate interval",
+    )
+
+    before_reconcile = datetime.now(timezone.utc)
+    scheduler.reconcile()
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.next_run_time is not None
+    assert runtime_job.next_run_time.astimezone(timezone.utc) <= (
+        before_reconcile + timedelta(seconds=2)
+    )

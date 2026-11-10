@@ -33,6 +33,7 @@ from app.schemas import (
     MonitoringTargetResponse,
     MonitoringTargetUpdate,
     ScheduledJobResponse,
+    ScheduledJobScheduleUpdate,
     SchedulerJobStatusResponse,
     SchedulerStatusResponse,
 )
@@ -246,6 +247,12 @@ def list_jobs(db: Session = Depends(get_db)):
                 name=job.name,
                 job_type=job.job_type,
                 interval_seconds=job.interval_seconds,
+                schedule_type=job.schedule_type,
+                cron_expression=job.cron_expression,
+                timezone=job.timezone,
+                start_at=job.start_at,
+                end_at=job.end_at,
+                schedule_is_customized=job.schedule_is_customized,
                 is_enabled=job.is_enabled,
                 target_id=job.target_id,
                 created_at=job.created_at,
@@ -255,6 +262,85 @@ def list_jobs(db: Session = Depends(get_db)):
         )
 
     return responses
+
+
+@router.patch(
+    "/jobs/{job_id}/schedule",
+    response_model=ScheduledJobResponse,
+    tags=["Scheduled Jobs"],
+)
+def update_job_schedule(
+    job_id: int,
+    payload: ScheduledJobScheduleUpdate,
+    db: Session = Depends(get_db),
+):
+    job = db.get(ScheduledJob, job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+
+    job.schedule_type = payload.schedule_type
+    job.interval_seconds = (
+        payload.interval_seconds
+        if payload.schedule_type == "interval"
+        else None
+    )
+    job.cron_expression = (
+        payload.cron_expression
+        if payload.schedule_type == "cron"
+        else None
+    )
+    job.timezone = payload.timezone.strip()
+    job.start_at = payload.start_at
+    job.end_at = payload.end_at
+    job.schedule_is_customized = True
+
+    if payload.is_enabled is not None:
+        job.is_enabled = payload.is_enabled
+
+    # Validate the exact APScheduler trigger before persisting changes.
+    try:
+        monitoring_scheduler.build_trigger(job)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        db.commit()
+        db.refresh(job)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Could not update scheduled job",
+        ) from exc
+
+    monitoring_scheduler.reconcile()
+
+    latest_execution = db.scalar(
+        select(JobExecution)
+        .where(JobExecution.job_id == job.id)
+        .order_by(JobExecution.started_at.desc())
+        .limit(1)
+    )
+
+    return ScheduledJobResponse(
+        id=job.id,
+        name=job.name,
+        job_type=job.job_type,
+        interval_seconds=job.interval_seconds,
+        schedule_type=job.schedule_type,
+        cron_expression=job.cron_expression,
+        timezone=job.timezone,
+        start_at=job.start_at,
+        end_at=job.end_at,
+        schedule_is_customized=job.schedule_is_customized,
+        is_enabled=job.is_enabled,
+        target_id=job.target_id,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        latest_execution=latest_execution,
+    )
 
 
 @router.get(

@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
+from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, model_validator
 
 
 Protocol = Literal["icmp", "tcp", "http", "https"]
@@ -72,11 +72,56 @@ class ScheduledJobResponse(BaseModel):
     name: str
     job_type: str
     interval_seconds: int | None
+    schedule_type: str
+    cron_expression: str | None
+    timezone: str
+    start_at: datetime | None
+    end_at: datetime | None
+    schedule_is_customized: bool
     is_enabled: bool
     target_id: int | None
     created_at: datetime
     updated_at: datetime
     latest_execution: JobExecutionResponse | None = None
+
+
+class ScheduledJobScheduleUpdate(BaseModel):
+    """Complete schedule configuration for a persisted scheduled job."""
+
+    schedule_type: Literal["interval", "cron"]
+    interval_seconds: int | None = Field(default=None, ge=5, le=86400)
+    cron_expression: str | None = Field(default=None, min_length=1, max_length=120)
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    is_enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_schedule_definition(self):
+        if self.schedule_type == "interval" and self.interval_seconds is None:
+            raise ValueError("Interval schedules require interval_seconds")
+
+        if self.schedule_type == "cron" and not self.cron_expression:
+            raise ValueError("Cron schedules require cron_expression")
+
+        if self.start_at is not None and self.end_at is not None:
+            start = self.start_at
+            end = self.end_at
+
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=dt_timezone.utc)
+            else:
+                start = start.astimezone(dt_timezone.utc)
+
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=dt_timezone.utc)
+            else:
+                end = end.astimezone(dt_timezone.utc)
+
+            if end <= start:
+                raise ValueError("Schedule end_at must be later than start_at")
+
+        return self
 
 
 class SchedulerJobStatusResponse(BaseModel):

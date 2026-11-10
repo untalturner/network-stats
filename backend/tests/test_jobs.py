@@ -170,3 +170,123 @@ def test_scheduler_status(client):
     assert result["is_running"] is False
     assert result["active_jobs"] == 0
     assert result["jobs"] == []
+
+
+def test_update_job_schedule_marks_schedule_customized(client):
+    from app.models import MonitoringTarget, ScheduledJob
+
+    job_id, target_id = create_job(client)
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/schedule",
+        json={
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "timezone": "Europe/Madrid",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schedule_is_customized"] is True
+    assert data["schedule_type"] == "interval"
+    assert data["interval_seconds"] == 300
+    assert data["timezone"] == "Europe/Madrid"
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        target = db.get(MonitoringTarget, target_id)
+        assert job.schedule_is_customized is True
+        assert job.interval_seconds == 300
+        assert target.interval_seconds == 30
+    finally:
+        db.close()
+
+
+def test_update_job_schedule_accepts_cron(client):
+    job_id, _ = create_job(client)
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/schedule",
+        json={
+            "schedule_type": "cron",
+            "cron_expression": "0 9 * * mon-fri",
+            "timezone": "Europe/Madrid",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schedule_type"] == "cron"
+    assert data["cron_expression"] == "0 9 * * mon-fri"
+    assert data["interval_seconds"] is None
+    assert data["schedule_is_customized"] is True
+
+
+def test_update_job_schedule_rejects_invalid_timezone_without_saving(client):
+    from app.models import ScheduledJob
+
+    job_id, _ = create_job(client)
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/schedule",
+        json={
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "timezone": "Not/A_Real_Timezone",
+        },
+    )
+
+    assert response.status_code == 422
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        assert job.schedule_is_customized is False
+        assert job.interval_seconds == 30
+        assert job.timezone == "UTC"
+    finally:
+        db.close()
+
+
+def test_update_job_schedule_rejects_invalid_cron_without_saving(client):
+    from app.models import ScheduledJob
+
+    job_id, _ = create_job(client)
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/schedule",
+        json={
+            "schedule_type": "cron",
+            "cron_expression": "not a valid cron",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 422
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        assert job.schedule_is_customized is False
+        assert job.schedule_type == "interval"
+        assert job.interval_seconds == 30
+    finally:
+        db.close()
+
+
+def test_update_job_schedule_returns_404_for_missing_job(client):
+    response = client.patch(
+        "/api/v1/jobs/999/schedule",
+        json={
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 404

@@ -94,6 +94,18 @@ class ScheduledJob(Base):
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     job_type: Mapped[str] = mapped_column(String(50), nullable=False)
     interval_seconds: Mapped[int | None] = mapped_column(Integer)
+    schedule_type: Mapped[str] = mapped_column(
+        String(20), default="interval", nullable=False
+    )
+    cron_expression: Mapped[str | None] = mapped_column(String(120))
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="UTC", nullable=False
+    )
+    start_at: Mapped[datetime | None] = mapped_column(DateTime)
+    end_at: Mapped[datetime | None] = mapped_column(DateTime)
+    schedule_is_customized: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     target_id: Mapped[int | None] = mapped_column(
         ForeignKey("monitoring_targets.id", ondelete="SET NULL"),
