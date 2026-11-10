@@ -847,3 +847,45 @@ def test_job_retry_defaults_are_disabled(scheduler):
 
         assert job.max_retries == 0
         assert job.retry_delay_seconds == 5.0
+
+@pytest.mark.asyncio
+async def test_scheduler_start_recovers_interrupted_execution(scheduler):
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Interrupted startup test",
+            job_type="interrupted_startup_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        execution = models.JobExecution(
+            job_id=job.id,
+            job_name=job.name,
+            started_at=datetime(2026, 11, 10, 10, 0, 0),
+            status="running",
+            attempt_count=2,
+            attempt_errors=["Attempt 1/3: RuntimeError: temporary failure"],
+        )
+        db.add(execution)
+        db.commit()
+        execution_id = execution.id
+
+    scheduler.start()
+    try:
+        with scheduler.session_factory() as db:
+            execution = db.get(models.JobExecution, execution_id)
+            assert execution.status == "failed"
+            assert execution.finished_at is not None
+            assert "interrupted" in execution.error.lower()
+            assert execution.attempt_count == 2
+            assert execution.attempt_errors == [
+                "Attempt 1/3: RuntimeError: temporary failure"
+            ]
+    finally:
+        scheduler.shutdown()
+
+    # A second recovery pass must not modify already recovered history.
+    assert scheduler.recover_interrupted_executions() == 0

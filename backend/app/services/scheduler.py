@@ -610,9 +610,48 @@ class MonitoringScheduler:
             len(desired_jobs),
         )
 
+    def recover_interrupted_executions(self) -> int:
+        """Mark executions left running by a previous process as failed."""
+        with self.session_factory() as db:
+            interrupted = db.scalars(
+                select(JobExecution).where(JobExecution.status == "running")
+            ).all()
+
+            if not interrupted:
+                return 0
+
+            recovered_at = utc_now()
+            recovery_message = (
+                "Execution interrupted because the application stopped "
+                "before completion."
+            )
+
+            for execution in interrupted:
+                execution.status = "failed"
+                execution.finished_at = recovered_at
+
+                existing_error = (execution.error or "").strip()
+                execution.error = (
+                    f"{existing_error}\n{recovery_message}"
+                    if existing_error
+                    else recovery_message
+                )[:2000]
+
+            db.commit()
+
+        logger.warning(
+            "Recovered %s interrupted scheduled execution(s)",
+            len(interrupted),
+        )
+        return len(interrupted)
+
     def start(self) -> None:
         if self.scheduler.running:
             return
+
+        # Close records left in 'running' by a previous process before
+        # registering recurring jobs in this process.
+        self.recover_interrupted_executions()
 
         self.scheduler.start()
         self.reconcile()
