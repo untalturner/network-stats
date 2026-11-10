@@ -585,3 +585,98 @@ async def test_queue_run_now_rejects_duplicate_manual_request(scheduler):
 def test_queue_run_now_requires_running_scheduler(scheduler):
     with pytest.raises(RuntimeError, match="Scheduler is not running"):
         scheduler.queue_run_now(123)
+
+
+
+def test_reconcile_removes_paused_job_without_disabling_it(scheduler):
+    target_id = create_target(scheduler.session_factory, "Pause target")
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.is_paused = True
+        db.commit()
+
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        assert job.is_paused is True
+        assert job.is_enabled is True
+
+    assert scheduler.scheduler.get_job(f"target-{target_id}") is None
+
+
+def test_reconcile_restores_paused_job_after_resume(scheduler):
+    target_id = create_target(scheduler.session_factory, "Resume target")
+    scheduler.reconcile()
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.is_paused = True
+        db.commit()
+
+    scheduler.reconcile()
+    assert scheduler.scheduler.get_job(f"target-{target_id}") is None
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.is_paused = False
+        db.commit()
+
+    scheduler.reconcile()
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+
+
+@pytest.mark.asyncio
+async def test_paused_job_ignores_scheduled_run(scheduler):
+    handler = AsyncMock()
+    scheduler.register_handler("paused_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Paused test",
+            job_type="paused_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            is_paused=True,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id, execution_kind="scheduled")
+
+    handler.assert_not_awaited()
+    with scheduler.session_factory() as db:
+        assert db.query(models.JobExecution).filter_by(job_id=job_id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_run_is_allowed_while_job_is_paused(scheduler):
+    handler = AsyncMock()
+    scheduler.register_handler("paused_manual_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Paused manual test",
+            job_type="paused_manual_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            is_paused=True,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id, execution_kind="manual")
+
+    handler.assert_awaited_once()
+    with scheduler.session_factory() as db:
+        job = db.get(models.ScheduledJob, job_id)
+        execution = db.query(models.JobExecution).filter_by(job_id=job_id).one()
+        assert job.is_paused is True
+        assert execution.status == "success"

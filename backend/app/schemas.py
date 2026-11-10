@@ -84,6 +84,7 @@ class ScheduledJobResponse(BaseModel):
     end_at: datetime | None
     schedule_is_customized: bool
     skip_next_run: bool
+    is_paused: bool
     is_enabled: bool
     target_id: int | None
     created_at: datetime

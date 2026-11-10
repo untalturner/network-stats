@@ -261,6 +261,13 @@ class MonitoringScheduler:
                 )
                 return
 
+        if execution_kind == "scheduled" and job.is_paused:
+            logger.info(
+                "Scheduled job %s is paused; scheduled execution ignored",
+                job.id,
+            )
+            return
+
         if execution_kind == "scheduled" and job.skip_next_run:
             skipped_at = utc_now()
             db.add(
@@ -485,6 +492,7 @@ class MonitoringScheduler:
                 if (
                     job.target_id in targets_by_id
                     and job.is_enabled
+                    and not job.is_paused
                     and targets_by_id[job.target_id].is_enabled
                 )
             }

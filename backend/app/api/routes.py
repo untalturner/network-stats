@@ -255,6 +255,7 @@ def list_jobs(db: Session = Depends(get_db)):
                 end_at=job.end_at,
                 schedule_is_customized=job.schedule_is_customized,
                 skip_next_run=job.skip_next_run,
+                is_paused=job.is_paused,
                 is_enabled=job.is_enabled,
                 target_id=job.target_id,
                 created_at=job.created_at,
@@ -338,6 +339,7 @@ def update_job_schedule(
         end_at=job.end_at,
         schedule_is_customized=job.schedule_is_customized,
         skip_next_run=job.skip_next_run,
+        is_paused=job.is_paused,
         is_enabled=job.is_enabled,
         target_id=job.target_id,
         created_at=job.created_at,
@@ -429,6 +431,78 @@ def skip_next_job(
     return JobActionResponse(
         job_id=job_id,
         message="The next scheduled run will be skipped",
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/pause",
+    response_model=JobActionResponse,
+    tags=["Scheduled Jobs"],
+)
+def pause_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+):
+    job = db.get(ScheduledJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+
+    if job.is_paused:
+        return JobActionResponse(
+            job_id=job_id,
+            message="Scheduled job is already paused",
+        )
+
+    job.is_paused = True
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Could not pause scheduled job",
+        ) from exc
+
+    monitoring_scheduler.reconcile()
+    return JobActionResponse(
+        job_id=job_id,
+        message="Scheduled job paused. Any execution already in progress will finish.",
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/resume",
+    response_model=JobActionResponse,
+    tags=["Scheduled Jobs"],
+)
+def resume_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+):
+    job = db.get(ScheduledJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+
+    if not job.is_paused:
+        return JobActionResponse(
+            job_id=job_id,
+            message="Scheduled job is not paused",
+        )
+
+    job.is_paused = False
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resume scheduled job",
+        ) from exc
+
+    monitoring_scheduler.reconcile()
+    return JobActionResponse(
+        job_id=job_id,
+        message="Scheduled job resumed",
     )
 
 

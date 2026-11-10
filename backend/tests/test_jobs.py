@@ -380,3 +380,52 @@ def test_run_now_returns_503_when_scheduler_is_stopped(client, monkeypatch):
 
     response = client.post(f"/api/v1/jobs/{job_id}/run")
     assert response.status_code == 503
+
+
+
+def test_pause_job_persists_paused_state_without_disabling(client):
+    from app.models import ScheduledJob
+
+    job_id, _ = create_job(client)
+
+    first = client.post(f"/api/v1/jobs/{job_id}/pause")
+    second = client.post(f"/api/v1/jobs/{job_id}/pause")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert "already paused" in second.json()["message"]
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        assert job.is_paused is True
+        assert job.is_enabled is True
+    finally:
+        db.close()
+
+
+def test_resume_job_clears_paused_state(client):
+    from app.models import ScheduledJob
+
+    job_id, _ = create_job(client)
+    pause_response = client.post(f"/api/v1/jobs/{job_id}/pause")
+    assert pause_response.status_code == 200
+
+    response = client.post(f"/api/v1/jobs/{job_id}/resume")
+    assert response.status_code == 200
+    assert response.json()["message"] == "Scheduled job resumed"
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        assert job.is_paused is False
+        assert job.is_enabled is True
+    finally:
+        db.close()
+
+
+def test_pause_and_resume_return_404_for_missing_job(client):
+    assert client.post("/api/v1/jobs/999/pause").status_code == 404
+    assert client.post("/api/v1/jobs/999/resume").status_code == 404

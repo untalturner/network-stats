@@ -10,6 +10,7 @@ import {
   Save,
   Play,
   SkipForward,
+  Pause,
 } from "lucide-react";
 
 type Execution = {
@@ -34,6 +35,7 @@ type ScheduledJob = {
   end_at: string | null;
   schedule_is_customized: boolean;
   skip_next_run: boolean;
+  is_paused: boolean;
   is_enabled: boolean;
   target_id: number | null;
   created_at: string;
@@ -229,7 +231,7 @@ export default function SchedulesPage() {
 
   async function performJobAction(
     jobId: number,
-    action: "run" | "skip-next",
+    action: "run" | "skip-next" | "pause" | "resume",
   ) {
     if (actingJobId !== null) return;
 
@@ -371,8 +373,8 @@ export default function SchedulesPage() {
                         <span>Job #{job.id} · {job.job_type.replaceAll("_", " ")}</span>
                       </div>
                     </div>
-                    <span className={`schedule-state ${job.is_enabled ? "enabled" : "disabled"}`}>
-                      {job.is_enabled ? "Enabled" : "Disabled"}
+                    <span className={`schedule-state ${job.is_paused ? "paused" : job.is_enabled ? "enabled" : "disabled"}`}>
+                      {job.is_paused ? "Paused" : job.is_enabled ? "Enabled" : "Disabled"}
                     </span>
                   </div>
 
@@ -409,6 +411,16 @@ export default function SchedulesPage() {
                   )}
 
                   <div className="schedule-actions">
+                    <button
+                      className="secondary-button schedule-control-button"
+                      type="button"
+                      onClick={() => void performJobAction(job.id, job.is_paused ? "resume" : "pause")}
+                      disabled={actingJobId !== null || (!job.is_paused && !job.is_enabled)}
+                    >
+                      {job.is_paused ? <Play size={14} /> : <Pause size={14} />}
+                      {job.is_paused ? "Resume" : "Pause"}
+                    </button>
+
                     <button
                       className="secondary-button schedule-control-button"
                       type="button"
