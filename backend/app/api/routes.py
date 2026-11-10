@@ -38,6 +38,12 @@ from app.schemas import (
     SchedulerJobStatusResponse,
     SchedulerStatusResponse,
 )
+from app.services.device_identity import (
+    normalize_hostname,
+    normalize_mac_address,
+    resolve_device_identity,
+    update_device_observation,
+)
 from app.services.discovery import (
     create_discovery_scan,
     run_discovery_scan_background,
@@ -941,56 +947,53 @@ def enroll_discovery_result(
     if result.device_id is not None:
         linked_device = db.get(Device, result.device_id)
         if linked_device is not None:
+            update_device_observation(
+                linked_device,
+                ip_address=result.ip_address,
+                mac_address=result.mac_address,
+                hostname=result.hostname,
+                observed_at=result.discovered_at,
+            )
             if payload.name and payload.name.strip():
                 linked_device.name = payload.name.strip()
-                try:
-                    db.commit()
-                    db.refresh(linked_device)
-                except SQLAlchemyError as exc:
-                    db.rollback()
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Could not update the enrolled device name",
-                    ) from exc
+            try:
+                db.commit()
+                db.refresh(linked_device)
+            except SQLAlchemyError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not update the enrolled device",
+                ) from exc
             return linked_device
 
-    mac_matches = []
-    if result.mac_address:
-        mac_matches = db.scalars(
-            select(Device).where(
-                func.lower(Device.mac_address) == result.mac_address.lower()
-            )
-        ).all()
-
-    ip_matches = db.scalars(
-        select(Device).where(Device.ip_address == result.ip_address)
-    ).all()
-
-    matching_ids = {device.id for device in mac_matches + ip_matches}
-
-    if len(matching_ids) > 1:
+    resolution = resolve_device_identity(
+        db,
+        ip_address=result.ip_address,
+        mac_address=result.mac_address,
+        hostname=result.hostname,
+    )
+    if resolution.conflict:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "The discovered MAC address and IP address match different "
-                "registered devices. Resolve the device records before enrolling."
-            ),
+            detail=resolution.reason or "Conflicting device identity matches.",
         )
 
-    if len(mac_matches) > 1 or len(ip_matches) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Multiple registered devices match this discovery result.",
-        )
-
-    existing_device = (mac_matches or ip_matches or [None])[0]
-
+    existing_device = resolution.device
     if existing_device is not None:
         result.device_id = existing_device.id
+        update_device_observation(
+            existing_device,
+            ip_address=result.ip_address,
+            mac_address=result.mac_address,
+            hostname=result.hostname,
+            observed_at=result.discovered_at,
+        )
         if payload.name and payload.name.strip():
             existing_device.name = payload.name.strip()
         try:
             db.commit()
+            db.refresh(existing_device)
         except SQLAlchemyError as exc:
             db.rollback()
             raise HTTPException(
@@ -999,13 +1002,15 @@ def enroll_discovery_result(
             ) from exc
         return existing_device
 
+    normalized_hostname = normalize_hostname(result.hostname)
     device = Device(
-        name=payload.name or result.hostname or result.ip_address,
-        hostname=result.hostname,
+        name=(payload.name or "").strip() or normalized_hostname or result.ip_address,
+        hostname=normalized_hostname,
         ip_address=result.ip_address,
-        mac_address=result.mac_address.lower() if result.mac_address else None,
+        mac_address=normalize_mac_address(result.mac_address),
         device_type=payload.device_type,
         notes=payload.notes,
+        last_seen_at=result.discovered_at,
     )
     db.add(device)
 

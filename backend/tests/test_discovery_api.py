@@ -269,10 +269,13 @@ def test_enroll_discovery_result_reuses_device_by_mac(client):
     assert response.status_code == 200
     assert response.json()["id"] == device_id
     assert response.json()["name"] == "Existing NAS"
+    assert response.json()["ip_address"] == "192.168.50.10"
+    assert response.json()["hostname"] == "nas-client"
 
     with client.app.state.testing_session_local() as db:
         assert db.query(Device).count() == 1
         assert db.get(DiscoveryResult, result_id).device_id == device_id
+        assert db.get(Device, device_id).last_seen_at is not None
 
 
 def test_enroll_discovery_result_uses_ip_fallback(client):
@@ -329,6 +332,60 @@ def test_enroll_discovery_result_rejects_conflicting_matches(client):
 
     assert response.status_code == 409
     assert "different" in response.json()["detail"]
+
+
+def test_enroll_discovery_result_reuses_device_by_hostname(client):
+    from app.models import Device, DiscoveryResult
+
+    result_id = create_discovery_result(client, mac_address=None)
+
+    with client.app.state.testing_session_local() as db:
+        device = Device(
+            name="Existing NAS",
+            hostname="NAS-CLIENT.",
+            ip_address="192.168.50.20",
+        )
+        db.add(device)
+        db.commit()
+        device_id = device.id
+
+    response = client.post(
+        f"/api/v1/discovery/results/{result_id}/enroll",
+        json={},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == device_id
+    assert response.json()["ip_address"] == "192.168.50.10"
+    assert response.json()["hostname"] == "nas-client"
+
+    with client.app.state.testing_session_local() as db:
+        assert db.query(Device).count() == 1
+        assert db.get(DiscoveryResult, result_id).device_id == device_id
+
+
+def test_enroll_discovery_result_rejects_ip_match_with_different_known_mac(client):
+    from app.models import Device
+
+    result_id = create_discovery_result(client)
+
+    with client.app.state.testing_session_local() as db:
+        db.add(
+            Device(
+                name="Different device",
+                ip_address="192.168.50.10",
+                mac_address="11:22:33:44:55:66",
+            )
+        )
+        db.commit()
+
+    response = client.post(
+        f"/api/v1/discovery/results/{result_id}/enroll",
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert "MAC" in response.json()["detail"]
 
 
 def test_enroll_discovery_result_is_idempotent(client):

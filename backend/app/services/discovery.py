@@ -3,7 +3,7 @@ import ipaddress
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.discovery import (
@@ -16,8 +16,13 @@ from app.discovery import (
     lookup_mac_address,
     validate_network,
 )
-from app.models import Device, DiscoveryResult, DiscoveryScan
+from app.models import DiscoveryResult, DiscoveryScan
 from app.probes import probe_icmp
+from app.services.device_identity import (
+    normalize_mac_address,
+    resolve_device_identity,
+    update_device_observation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,26 +70,6 @@ async def discover_icmp_hosts(
         *(probe_address(address) for address in addresses)
     )
     return dict(zip(addresses, results))
-
-
-def find_existing_device_id(
-    db: Session,
-    ip_address: str,
-    mac_address: str | None,
-) -> int | None:
-    """Match a discovered host to one unambiguous, already-enrolled device."""
-    conditions = [Device.ip_address == ip_address]
-
-    if mac_address:
-        conditions.append(func.lower(Device.mac_address) == mac_address.lower())
-
-    matches = db.scalars(
-        select(Device.id).where(or_(*conditions)).distinct()
-    ).all()
-
-    # Do not guess if the IP and MAC identify different devices, or if
-    # duplicate records make the match ambiguous.
-    return matches[0] if len(matches) == 1 else None
 
 
 def create_discovery_scan(db: Session, network_cidr: str) -> DiscoveryScan:
@@ -274,37 +259,28 @@ async def execute_discovery_scan(
         for host, (mac_address, hostname), icmp_result in zip(
             hosts, enriched_hosts, icmp_results
         ):
-            existing_device_id = find_existing_device_id(
+            resolution = resolve_device_identity(
                 db,
                 ip_address=host.ip_address,
                 mac_address=mac_address,
+                hostname=hostname,
             )
 
-            resolved_mac_address = mac_address.lower() if mac_address else None
+            existing_device = resolution.device
+            existing_device_id = existing_device.id if existing_device else None
+            resolved_mac_address = normalize_mac_address(mac_address)
 
-            if existing_device_id is not None:
-                existing_device = db.get(Device, existing_device_id)
-                if existing_device is not None:
-                    # An IP match must not override a different known MAC.
-                    if (
-                        mac_address
-                        and existing_device.mac_address
-                        and existing_device.mac_address.lower() != mac_address.lower()
-                    ):
-                        existing_device_id = None
-                    else:
-                        # Preserve a known MAC when the current scan cannot resolve it.
-                        resolved_mac_address = (
-                            resolved_mac_address or existing_device.mac_address
-                        )
-                        if resolved_mac_address and not existing_device.mac_address:
-                            existing_device.mac_address = resolved_mac_address
-
-                        # A MAC match is reliable enough to follow a changed DHCP IP.
-                        if mac_address:
-                            existing_device.ip_address = host.ip_address
-
-                        existing_device.last_seen_at = utc_now()
+            if existing_device is not None:
+                update_device_observation(
+                    existing_device,
+                    ip_address=host.ip_address,
+                    mac_address=mac_address,
+                    hostname=hostname,
+                    observed_at=utc_now(),
+                )
+                resolved_mac_address = (
+                    resolved_mac_address or existing_device.mac_address
+                )
 
             discovery_results.append(
                 DiscoveryResult(
