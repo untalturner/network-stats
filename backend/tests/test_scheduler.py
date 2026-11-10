@@ -491,3 +491,97 @@ def test_inherited_interval_keeps_immediate_first_probe(scheduler):
     assert runtime_job.next_run_time.astimezone(timezone.utc) <= (
         before_reconcile + timedelta(seconds=2)
     )
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_consumes_skip_next_without_calling_handler(scheduler):
+    handler = AsyncMock()
+    scheduler.register_handler("skip_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Skip test",
+            job_type="skip_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            skip_next_run=True,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id, execution_kind="scheduled")
+
+    handler.assert_not_awaited()
+    with scheduler.session_factory() as db:
+        job = db.get(models.ScheduledJob, job_id)
+        execution = (
+            db.query(models.JobExecution)
+            .filter_by(job_id=job_id)
+            .one()
+        )
+        assert job.skip_next_run is False
+        assert execution.status == "skipped"
+        assert execution.finished_at is not None
+        assert "skip-next" in execution.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_manual_run_does_not_consume_skip_next(scheduler):
+    handler = AsyncMock()
+    scheduler.register_handler("manual_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Manual test",
+            job_type="manual_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            skip_next_run=True,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id, execution_kind="manual")
+
+    handler.assert_awaited_once()
+    with scheduler.session_factory() as db:
+        job = db.get(models.ScheduledJob, job_id)
+        execution = (
+            db.query(models.JobExecution)
+            .filter_by(job_id=job_id)
+            .one()
+        )
+        assert job.skip_next_run is True
+        assert execution.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_queue_run_now_rejects_duplicate_manual_request(scheduler):
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Queue test",
+            job_type="queue_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    scheduler.scheduler.start()
+    try:
+        assert scheduler.queue_run_now(job_id) is True
+        assert scheduler.queue_run_now(job_id) is False
+        assert scheduler.scheduler.get_job(f"manual-{job_id}") is not None
+    finally:
+        scheduler.shutdown()
+
+
+def test_queue_run_now_requires_running_scheduler(scheduler):
+    with pytest.raises(RuntimeError, match="Scheduler is not running"):
+        scheduler.queue_run_now(123)

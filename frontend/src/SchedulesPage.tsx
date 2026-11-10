@@ -8,6 +8,8 @@ import {
   Pencil,
   X,
   Save,
+  Play,
+  SkipForward,
 } from "lucide-react";
 
 type Execution = {
@@ -31,6 +33,7 @@ type ScheduledJob = {
   start_at: string | null;
   end_at: string | null;
   schedule_is_customized: boolean;
+  skip_next_run: boolean;
   is_enabled: boolean;
   target_id: number | null;
   created_at: string;
@@ -124,6 +127,7 @@ export default function SchedulesPage() {
   const [draft, setDraft] = useState<ScheduleDraft>(emptyDraft);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [actingJobId, setActingJobId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -220,6 +224,38 @@ export default function SchedulesPage() {
       setError(err instanceof Error ? err.message : "Could not save schedule.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function performJobAction(
+    jobId: number,
+    action: "run" | "skip-next",
+  ) {
+    if (actingJobId !== null) return;
+
+    setActingJobId(jobId);
+    setError("");
+    setNotice("");
+
+    try {
+      const result = await apiRequest<{ job_id: number; message: string }>(
+        `/jobs/${jobId}/${action}`,
+        { method: "POST" },
+      );
+
+      setNotice(result.message);
+      await loadData();
+
+      if (expandedJob === jobId) {
+        const history = await apiRequest<Execution[]>(
+          `/jobs/${jobId}/executions?limit=50`,
+        );
+        setHistories((current) => ({ ...current, [jobId]: history }));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not perform job action.");
+    } finally {
+      setActingJobId(null);
     }
   }
 
@@ -355,6 +391,10 @@ export default function SchedulesPage() {
                       <span>Configuration</span>
                       <strong>{job.schedule_is_customized ? "Custom schedule" : "Inherited from target"}</strong>
                     </div>
+                    <div>
+                      <span>Skip next</span>
+                      <strong>{job.skip_next_run ? "Armed" : "No"}</strong>
+                    </div>
                   </div>
 
                   {(job.start_at || job.end_at) && (
@@ -369,6 +409,28 @@ export default function SchedulesPage() {
                   )}
 
                   <div className="schedule-actions">
+                    <button
+                      className="secondary-button schedule-control-button"
+                      type="button"
+                      onClick={() => void performJobAction(job.id, "run")}
+                      disabled={!job.is_enabled || actingJobId !== null || !scheduler?.is_running}
+                      title={!scheduler?.is_running ? "Scheduler is stopped" : "Queue an immediate run"}
+                    >
+                      <Play size={14} />
+                      {actingJobId === job.id ? "Working..." : "Run now"}
+                    </button>
+
+                    <button
+                      className="secondary-button schedule-control-button"
+                      type="button"
+                      onClick={() => void performJobAction(job.id, "skip-next")}
+                      disabled={actingJobId !== null || job.skip_next_run}
+                      title={job.skip_next_run ? "Next scheduled run is already marked to be skipped" : "Skip the next scheduled execution"}
+                    >
+                      <SkipForward size={14} />
+                      {job.skip_next_run ? "Skip armed" : "Skip next"}
+                    </button>
+
                     <button
                       className="secondary-button"
                       type="button"

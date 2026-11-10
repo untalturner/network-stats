@@ -5,6 +5,7 @@ from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
@@ -33,6 +34,7 @@ class MonitoringScheduler:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.execution_lock = asyncio.Lock()
         self.job_handlers: dict[str, JobHandler] = {}
+        self._manual_run_ids: set[int] = set()
 
         self.register_handler(
             "connectivity_probe",
@@ -152,6 +154,43 @@ class MonitoringScheduler:
             trigger.end_date,
         )
 
+    def queue_run_now(self, scheduled_job_id: int) -> bool:
+        """Queue one immediate manual execution without changing its schedule."""
+        if not self.scheduler.running:
+            raise RuntimeError("Scheduler is not running")
+
+        if scheduled_job_id in self._manual_run_ids:
+            return False
+
+        self._manual_run_ids.add(scheduled_job_id)
+        try:
+            self.scheduler.add_job(
+                self._run_manual_job,
+                trigger=DateTrigger(run_date=datetime.now(timezone.utc)),
+                id=f"manual-{scheduled_job_id}",
+                args=[scheduled_job_id],
+                name=f"Manual run for job {scheduled_job_id}",
+                max_instances=1,
+                # Manual requests should not be silently discarded if the
+                # event loop is temporarily delayed.
+                misfire_grace_time=None,
+            )
+        except Exception:
+            self._manual_run_ids.discard(scheduled_job_id)
+            raise
+
+        return True
+
+    async def _run_manual_job(self, scheduled_job_id: int) -> None:
+        """Run a queued manual execution and release its duplicate guard."""
+        try:
+            await self._run_job(
+                scheduled_job_id,
+                execution_kind="manual",
+            )
+        finally:
+            self._manual_run_ids.discard(scheduled_job_id)
+
     async def _execute_connectivity_probe(
         self,
         db: Session,
@@ -164,12 +203,20 @@ class MonitoringScheduler:
 
         return await execute_target_probe(db, job.target_id)
 
-    async def _run_job(self, scheduled_job_id: int) -> None:
+    async def _run_job(
+        self,
+        scheduled_job_id: int,
+        execution_kind: str = "scheduled",
+    ) -> None:
         """Execute any persisted job using its registered handler."""
         async with self.execution_lock:
-            await self._run_job_locked(scheduled_job_id)
+            await self._run_job_locked(scheduled_job_id, execution_kind)
 
-    async def _run_job_locked(self, scheduled_job_id: int) -> None:
+    async def _run_job_locked(
+        self,
+        scheduled_job_id: int,
+        execution_kind: str = "scheduled",
+    ) -> None:
         """Load and execute a persisted job using its registered handler."""
         db = self.session_factory()
 
@@ -183,12 +230,17 @@ class MonitoringScheduler:
                 )
                 return
 
-            await self._execute_job(db, job)
+            await self._execute_job(db, job, execution_kind)
 
         finally:
             db.close()
 
-    async def _execute_job(self, db: Session, job: ScheduledJob) -> None:
+    async def _execute_job(
+        self,
+        db: Session,
+        job: ScheduledJob,
+        execution_kind: str = "scheduled",
+    ) -> None:
         """Execute a loaded job and persist its execution outcome."""
         execution_id: int | None = None
 
@@ -197,6 +249,33 @@ class MonitoringScheduler:
                 "Scheduled job %s is disabled; execution skipped",
                 job.id,
             )
+            return
+
+        if job.job_type == "connectivity_probe" and job.target_id is not None:
+            target = db.get(MonitoringTarget, job.target_id)
+            if target is None or not target.is_enabled:
+                logger.info(
+                    "Connectivity job %s has a disabled or missing target; "
+                    "execution skipped",
+                    job.id,
+                )
+                return
+
+        if execution_kind == "scheduled" and job.skip_next_run:
+            skipped_at = utc_now()
+            db.add(
+                JobExecution(
+                    job_id=job.id,
+                    job_name=job.name,
+                    started_at=skipped_at,
+                    finished_at=skipped_at,
+                    status="skipped",
+                    error="Skipped by the skip-next control",
+                )
+            )
+            job.skip_next_run = False
+            db.commit()
+            logger.info("Skipped next scheduled execution for job %s", job.id)
             return
 
         try:
@@ -416,6 +495,8 @@ class MonitoringScheduler:
         }
 
         for job_id in existing_jobs:
+            if not job_id.startswith("target-"):
+                continue
             target_id = int(job_id.removeprefix("target-"))
 
             if target_id not in desired_jobs:
@@ -433,7 +514,7 @@ class MonitoringScheduler:
                 if (
                     self._trigger_signature(existing_job.trigger)
                     == self._trigger_signature(trigger)
-                    and existing_job.args == [persistent_job_id]
+                    and existing_job.args == [persistent_job_id, "scheduled"]
                 ):
                     continue
 
@@ -443,7 +524,7 @@ class MonitoringScheduler:
                 self._run_job,
                 trigger=trigger,
                 id=job_id,
-                args=[persistent_job_id],
+                args=[persistent_job_id, "scheduled"],
                 name=f"Probe target {target_id}",
                 # Preserve the legacy immediate first probe only for
                 # inherited interval jobs. Custom intervals and cron jobs
@@ -479,6 +560,7 @@ class MonitoringScheduler:
             return
 
         self.scheduler.shutdown(wait=False)
+        self._manual_run_ids.clear()
         logger.info("Monitoring scheduler stopped")
 
 

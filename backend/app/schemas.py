@@ -65,6 +65,11 @@ class JobExecutionResponse(BaseModel):
     error: str | None
 
 
+class JobActionResponse(BaseModel):
+    job_id: int
+    message: str
+
+
 class ScheduledJobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -78,6 +83,7 @@ class ScheduledJobResponse(BaseModel):
     start_at: datetime | None
     end_at: datetime | None
     schedule_is_customized: bool
+    skip_next_run: bool
     is_enabled: bool
     target_id: int | None
     created_at: datetime

@@ -290,3 +290,93 @@ def test_update_job_schedule_returns_404_for_missing_job(client):
     )
 
     assert response.status_code == 404
+
+
+def test_skip_next_marks_job_and_is_idempotent(client):
+    from app.models import ScheduledJob
+
+    job_id, _ = create_job(client)
+
+    first = client.post(f"/api/v1/jobs/{job_id}/skip-next")
+    second = client.post(f"/api/v1/jobs/{job_id}/skip-next")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert "already marked" in second.json()["message"]
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        job = db.get(ScheduledJob, job_id)
+        assert job.skip_next_run is True
+    finally:
+        db.close()
+
+
+def test_skip_next_returns_404_for_missing_job(client):
+    response = client.post("/api/v1/jobs/999/skip-next")
+    assert response.status_code == 404
+
+
+def test_run_now_queues_enabled_job(client, monkeypatch):
+    job_id, _ = create_job(client)
+    calls = []
+
+    def queue_run_now(scheduled_job_id):
+        calls.append(scheduled_job_id)
+        return True
+
+    monkeypatch.setattr(
+        monitoring_scheduler,
+        "queue_run_now",
+        queue_run_now,
+    )
+
+    response = client.post(f"/api/v1/jobs/{job_id}/run")
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == job_id
+    assert calls == [job_id]
+
+
+def test_run_now_rejects_disabled_target(client, monkeypatch):
+    from app.models import MonitoringTarget
+
+    job_id, target_id = create_job(client)
+
+    dependency = app.dependency_overrides[get_db]
+    db = next(dependency())
+    try:
+        target = db.get(MonitoringTarget, target_id)
+        target.is_enabled = False
+        db.commit()
+    finally:
+        db.close()
+
+    def unexpected_queue(_job_id):
+        raise AssertionError("Disabled target must be rejected before queueing")
+
+    monkeypatch.setattr(
+        monitoring_scheduler,
+        "queue_run_now",
+        unexpected_queue,
+    )
+
+    response = client.post(f"/api/v1/jobs/{job_id}/run")
+    assert response.status_code == 409
+
+
+def test_run_now_returns_503_when_scheduler_is_stopped(client, monkeypatch):
+    job_id, _ = create_job(client)
+
+    def stopped_scheduler(_job_id):
+        raise RuntimeError("Scheduler is not running")
+
+    monkeypatch.setattr(
+        monitoring_scheduler,
+        "queue_run_now",
+        stopped_scheduler,
+    )
+
+    response = client.post(f"/api/v1/jobs/{job_id}/run")
+    assert response.status_code == 503

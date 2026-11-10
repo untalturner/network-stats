@@ -34,6 +34,7 @@ from app.schemas import (
     MonitoringTargetUpdate,
     ScheduledJobResponse,
     ScheduledJobScheduleUpdate,
+    JobActionResponse,
     SchedulerJobStatusResponse,
     SchedulerStatusResponse,
 )
@@ -253,6 +254,7 @@ def list_jobs(db: Session = Depends(get_db)):
                 start_at=job.start_at,
                 end_at=job.end_at,
                 schedule_is_customized=job.schedule_is_customized,
+                skip_next_run=job.skip_next_run,
                 is_enabled=job.is_enabled,
                 target_id=job.target_id,
                 created_at=job.created_at,
@@ -335,11 +337,98 @@ def update_job_schedule(
         start_at=job.start_at,
         end_at=job.end_at,
         schedule_is_customized=job.schedule_is_customized,
+        skip_next_run=job.skip_next_run,
         is_enabled=job.is_enabled,
         target_id=job.target_id,
         created_at=job.created_at,
         updated_at=job.updated_at,
         latest_execution=latest_execution,
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/run",
+    response_model=JobActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Scheduled Jobs"],
+)
+async def run_job_now(
+    job_id: int,
+    db: Session = Depends(get_db),
+):
+    job = db.get(ScheduledJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+
+    if not job.is_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot run a disabled scheduled job",
+        )
+
+    if job.job_type not in monitoring_scheduler.job_handlers:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No handler is registered for job type {job.job_type!r}",
+        )
+
+    if job.job_type == "connectivity_probe" and job.target_id is not None:
+        target = db.get(MonitoringTarget, job.target_id)
+        if target is None or not target.is_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot run a job whose monitoring target is disabled",
+            )
+
+    try:
+        queued = monitoring_scheduler.queue_run_now(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if not queued:
+        raise HTTPException(
+            status_code=409,
+            detail="A manual run is already queued or running for this job",
+        )
+
+    return JobActionResponse(
+        job_id=job_id,
+        message="Manual run queued",
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/skip-next",
+    response_model=JobActionResponse,
+    tags=["Scheduled Jobs"],
+)
+def skip_next_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+):
+    job = db.get(ScheduledJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+
+    if job.skip_next_run:
+        return JobActionResponse(
+            job_id=job_id,
+            message="The next scheduled run is already marked to be skipped",
+        )
+
+    job.skip_next_run = True
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Could not mark the next scheduled run to be skipped",
+        ) from exc
+
+    return JobActionResponse(
+        job_id=job_id,
+        message="The next scheduled run will be skipped",
     )
 
 
