@@ -21,6 +21,8 @@ type Execution = {
   finished_at: string | null;
   status: string;
   error: string | null;
+  attempt_count: number;
+  attempt_errors: string[];
 };
 
 type ScheduledJob = {
@@ -37,6 +39,8 @@ type ScheduledJob = {
   skip_next_run: boolean;
   is_paused: boolean;
   execution_timeout_seconds: number;
+  max_retries: number;
+  retry_delay_seconds: number;
   is_enabled: boolean;
   target_id: number | null;
   created_at: string;
@@ -58,6 +62,8 @@ type ScheduleDraft = {
   start_at: string;
   end_at: string;
   execution_timeout_seconds: string;
+  max_retries: string;
+  retry_delay_seconds: string;
   is_enabled: boolean;
 };
 
@@ -69,6 +75,8 @@ const emptyDraft: ScheduleDraft = {
   start_at: "",
   end_at: "",
   execution_timeout_seconds: "300",
+  max_retries: "0",
+  retry_delay_seconds: "5",
   is_enabled: true,
 };
 
@@ -168,6 +176,8 @@ export default function SchedulesPage() {
       start_at: toLocalDateTime(job.start_at),
       end_at: toLocalDateTime(job.end_at),
       execution_timeout_seconds: String(job.execution_timeout_seconds),
+      max_retries: String(job.max_retries),
+      retry_delay_seconds: String(job.retry_delay_seconds),
       is_enabled: job.is_enabled,
     });
     setError("");
@@ -207,6 +217,8 @@ export default function SchedulesPage() {
         ? new Date(draft.end_at).toISOString()
         : null,
       execution_timeout_seconds: Number(draft.execution_timeout_seconds),
+      max_retries: Number(draft.max_retries),
+      retry_delay_seconds: Number(draft.retry_delay_seconds),
       is_enabled: draft.is_enabled,
     };
 
@@ -562,6 +574,42 @@ export default function SchedulesPage() {
                       </label>
 
                       <label>
+                        Maximum retries
+                        <input
+                          type="number"
+                          min={0}
+                          max={10}
+                          step={1}
+                          required
+                          value={draft.max_retries}
+                          onChange={(event) =>
+                            setDraft({ ...draft, max_retries: event.target.value })
+                          }
+                        />
+                        <span className="schedule-field-hint">
+                          Additional attempts after the first failure. Set to 0 to disable retries.
+                        </span>
+                      </label>
+
+                      <label>
+                        Delay between retries (seconds)
+                        <input
+                          type="number"
+                          min={1}
+                          max={3600}
+                          step={1}
+                          required
+                          value={draft.retry_delay_seconds}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              retry_delay_seconds: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+
+                      <label>
                         Start date and time (your local time, optional)
                         <input
                           type="datetime-local"
@@ -625,7 +673,7 @@ export default function SchedulesPage() {
                         <div className="history-table-wrapper">
                           <table className="history-table">
                             <thead>
-                              <tr><th>Started</th><th>Finished</th><th>Status</th><th>Error</th></tr>
+                              <tr><th>Started</th><th>Finished</th><th>Status</th><th>Attempts</th><th>Attempt details</th></tr>
                             </thead>
                             <tbody>
                               {history.map((execution) => (
@@ -633,7 +681,16 @@ export default function SchedulesPage() {
                                   <td>{formatDate(execution.started_at)}</td>
                                   <td>{formatDate(execution.finished_at)}</td>
                                   <td><span className={`execution-status ${execution.status}`}>{executionLabel(execution.status)}</span></td>
-                                  <td>{execution.error ?? "—"}</td>
+                                  <td>{execution.attempt_count}</td>
+                                  <td>
+                                    {execution.error && <div>{execution.error}</div>}
+                                    {execution.attempt_errors.map((attemptError, index) => (
+                                      <div key={`${execution.id}-attempt-${index}`}>
+                                        {attemptError}
+                                      </div>
+                                    ))}
+                                    {!execution.error && execution.attempt_errors.length === 0 && "—"}
+                                  </td>
                                 </tr>
                               ))}
                             </tbody>

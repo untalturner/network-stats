@@ -737,3 +737,113 @@ def test_job_execution_timeout_defaults_to_five_minutes(scheduler):
         db.refresh(job)
 
         assert job.execution_timeout_seconds == 300.0
+
+
+@pytest.mark.asyncio
+async def test_job_retries_then_succeeds_and_records_attempt_history(scheduler):
+    handler = AsyncMock(
+        side_effect=[RuntimeError("temporary network failure"), None]
+    )
+    scheduler.register_handler("retry_success_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Retry success test",
+            job_type="retry_success_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            max_retries=1,
+            retry_delay_seconds=0.01,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id)
+
+    assert handler.await_count == 2
+    with scheduler.session_factory() as db:
+        executions = db.query(models.JobExecution).filter_by(job_id=job_id).all()
+        assert len(executions) == 1
+        execution = executions[0]
+        assert execution.status == "success"
+        assert execution.attempt_count == 2
+        assert len(execution.attempt_errors) == 1
+        assert "temporary network failure" in execution.attempt_errors[0]
+        assert execution.error is None
+
+
+@pytest.mark.asyncio
+async def test_job_fails_after_exhausting_retries(scheduler):
+    handler = AsyncMock(side_effect=RuntimeError("persistent failure"))
+    scheduler.register_handler("retry_failure_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Retry failure test",
+            job_type="retry_failure_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            max_retries=2,
+            retry_delay_seconds=0.01,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id)
+
+    assert handler.await_count == 3
+    with scheduler.session_factory() as db:
+        execution = db.query(models.JobExecution).filter_by(job_id=job_id).one()
+        assert execution.status == "failed"
+        assert execution.attempt_count == 3
+        assert len(execution.attempt_errors) == 3
+        assert execution.error == "persistent failure"
+
+
+@pytest.mark.asyncio
+async def test_job_does_not_retry_intentional_skip(scheduler):
+    handler = AsyncMock(side_effect=LookupError("resource unavailable"))
+    scheduler.register_handler("retry_skip_test", handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Retry skip test",
+            job_type="retry_skip_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            max_retries=3,
+            retry_delay_seconds=0.01,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id)
+
+    handler.assert_awaited_once()
+    with scheduler.session_factory() as db:
+        execution = db.query(models.JobExecution).filter_by(job_id=job_id).one()
+        assert execution.status == "skipped"
+        assert execution.attempt_count == 1
+        assert execution.attempt_errors == []
+
+
+def test_job_retry_defaults_are_disabled(scheduler):
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Default retry test",
+            job_type="retry_default_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        assert job.max_retries == 0
+        assert job.retry_delay_seconds == 5.0

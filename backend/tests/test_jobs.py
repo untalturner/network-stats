@@ -130,6 +130,8 @@ def test_list_job_executions(client):
     executions = response.json()
     assert len(executions) == 2
     assert {item["status"] for item in executions} == {"success", "failed"}
+    assert all(item["attempt_count"] == 1 for item in executions)
+    assert all(item["attempt_errors"] == [] for item in executions)
 
 
 def test_job_execution_history_survives_target_deletion(client):
@@ -184,6 +186,8 @@ def test_update_job_schedule_marks_schedule_customized(client):
             "interval_seconds": 300,
             "timezone": "Europe/Madrid",
             "execution_timeout_seconds": 45,
+            "max_retries": 2,
+            "retry_delay_seconds": 4,
         },
     )
 
@@ -194,6 +198,8 @@ def test_update_job_schedule_marks_schedule_customized(client):
     assert data["interval_seconds"] == 300
     assert data["timezone"] == "Europe/Madrid"
     assert data["execution_timeout_seconds"] == 45
+    assert data["max_retries"] == 2
+    assert data["retry_delay_seconds"] == 4
 
     dependency = app.dependency_overrides[get_db]
     db = next(dependency())
@@ -203,6 +209,8 @@ def test_update_job_schedule_marks_schedule_customized(client):
         assert job.schedule_is_customized is True
         assert job.interval_seconds == 300
         assert job.execution_timeout_seconds == 45
+        assert job.max_retries == 2
+        assert job.retry_delay_seconds == 4
         assert target.interval_seconds == 30
     finally:
         db.close()

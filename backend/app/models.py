@@ -115,6 +115,12 @@ class ScheduledJob(Base):
     execution_timeout_seconds: Mapped[float] = mapped_column(
         Float, default=300.0, server_default="300", nullable=False
     )
+    max_retries: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    retry_delay_seconds: Mapped[float] = mapped_column(
+        Float, default=5.0, server_default="5", nullable=False
+    )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     target_id: Mapped[int | None] = mapped_column(
         ForeignKey("monitoring_targets.id", ondelete="SET NULL"),
@@ -150,6 +156,12 @@ class JobExecution(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     error: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+    attempt_errors: Mapped[list[str]] = mapped_column(
+        JSON, default=list, server_default="[]", nullable=False
+    )
 
     job: Mapped[ScheduledJob | None] = relationship(back_populates="executions")
 

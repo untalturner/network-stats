@@ -285,12 +285,16 @@ class MonitoringScheduler:
             logger.info("Skipped next scheduled execution for job %s", job.id)
             return
 
+        attempt_errors: list[str] = []
+
         try:
             execution = JobExecution(
                 job_id=job.id,
                 job_name=job.name,
                 started_at=utc_now(),
                 status="running",
+                attempt_count=0,
+                attempt_errors=[],
             )
             db.add(execution)
             db.commit()
@@ -304,40 +308,79 @@ class MonitoringScheduler:
                     f"No handler registered for job type {job.job_type!r}"
                 )
 
-            try:
-                await asyncio.wait_for(
-                    handler(db, job),
-                    timeout=float(job.execution_timeout_seconds),
-                )
-            except asyncio.TimeoutError as exc:
-                timeout_seconds = float(job.execution_timeout_seconds)
-                raise TimeoutError(
-                    f"Execution timed out after {timeout_seconds:g} seconds"
-                ) from exc
+            max_retries = int(job.max_retries)
+            retry_delay = float(job.retry_delay_seconds)
 
-            self._finish_execution(db, execution_id, status="success")
+            for attempt_number in range(1, max_retries + 2):
+                current_execution = db.get(JobExecution, execution_id)
+                current_execution.attempt_count = attempt_number
+                db.commit()
 
-            logger.info(
-                "Scheduled job %s (%s) completed successfully "
-                "(execution %s)",
-                job.id,
-                job.job_type,
-                execution_id,
-            )
+                try:
+                    try:
+                        await asyncio.wait_for(
+                            handler(db, job),
+                            timeout=float(job.execution_timeout_seconds),
+                        )
+                    except asyncio.TimeoutError as timeout_exc:
+                        timeout_seconds = float(job.execution_timeout_seconds)
+                        raise TimeoutError(
+                            f"Execution timed out after {timeout_seconds:g} seconds"
+                        ) from timeout_exc
 
-        except LookupError as exc:
-            if execution_id is not None:
+                except (LookupError, PermissionError):
+                    raise
+
+                except Exception as attempt_exc:
+                    # Discard any uncommitted handler changes before a retry.
+                    db.rollback()
+                    attempt_errors.append(
+                        f"Attempt {attempt_number}/{max_retries + 1}: "
+                        f"{type(attempt_exc).__name__}: {attempt_exc}"
+                    )
+
+                    current_execution = db.get(JobExecution, execution_id)
+                    current_execution.attempt_errors = list(attempt_errors)
+                    db.commit()
+
+                    if attempt_number <= max_retries:
+                        logger.warning(
+                            "Scheduled job %s attempt %s/%s failed; "
+                            "retrying in %s seconds: %s",
+                            job.id,
+                            attempt_number,
+                            max_retries + 1,
+                            retry_delay,
+                            attempt_exc,
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
+
+                    raise
+
+                current_execution = db.get(JobExecution, execution_id)
+                current_execution.attempt_errors = list(attempt_errors)
                 self._finish_execution(
                     db,
                     execution_id,
-                    status="skipped",
-                    error=str(exc),
+                    status="success",
                 )
 
-            logger.info("Scheduled job %s was skipped: %s", job.id, exc)
+                logger.info(
+                    "Scheduled job %s (%s) completed successfully "
+                    "on attempt %s (execution %s)",
+                    job.id,
+                    job.job_type,
+                    attempt_number,
+                    execution_id,
+                )
+                return
 
-        except PermissionError as exc:
+        except (LookupError, PermissionError) as exc:
             if execution_id is not None:
+                db.rollback()
+                current_execution = db.get(JobExecution, execution_id)
+                current_execution.attempt_errors = list(attempt_errors)
                 self._finish_execution(
                     db,
                     execution_id,
@@ -350,6 +393,9 @@ class MonitoringScheduler:
         except Exception as exc:
             if execution_id is not None:
                 try:
+                    db.rollback()
+                    current_execution = db.get(JobExecution, execution_id)
+                    current_execution.attempt_errors = list(attempt_errors)
                     self._finish_execution(
                         db,
                         execution_id,

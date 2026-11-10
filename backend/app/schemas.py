@@ -63,6 +63,8 @@ class JobExecutionResponse(BaseModel):
     finished_at: datetime | None
     status: str
     error: str | None
+    attempt_count: int
+    attempt_errors: list[str]
 
 
 class JobActionResponse(BaseModel):
@@ -86,6 +88,8 @@ class ScheduledJobResponse(BaseModel):
     skip_next_run: bool
     is_paused: bool
     execution_timeout_seconds: float
+    max_retries: int
+    retry_delay_seconds: float
     is_enabled: bool
     target_id: int | None
     created_at: datetime
@@ -105,6 +109,8 @@ class ScheduledJobScheduleUpdate(BaseModel):
     execution_timeout_seconds: float = Field(
         default=300.0, ge=1.0, le=86400.0
     )
+    max_retries: int = Field(default=0, ge=0, le=10)
+    retry_delay_seconds: float = Field(default=5.0, ge=1.0, le=3600.0)
     is_enabled: bool | None = None
 
     @model_validator(mode="after")

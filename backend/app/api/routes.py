@@ -257,6 +257,8 @@ def list_jobs(db: Session = Depends(get_db)):
                 skip_next_run=job.skip_next_run,
                 is_paused=job.is_paused,
                 execution_timeout_seconds=job.execution_timeout_seconds,
+                max_retries=job.max_retries,
+                retry_delay_seconds=job.retry_delay_seconds,
                 is_enabled=job.is_enabled,
                 target_id=job.target_id,
                 created_at=job.created_at,
@@ -298,6 +300,8 @@ def update_job_schedule(
     job.start_at = payload.start_at
     job.end_at = payload.end_at
     job.execution_timeout_seconds = payload.execution_timeout_seconds
+    job.max_retries = payload.max_retries
+    job.retry_delay_seconds = payload.retry_delay_seconds
     job.schedule_is_customized = True
 
     if payload.is_enabled is not None:
@@ -343,6 +347,8 @@ def update_job_schedule(
         skip_next_run=job.skip_next_run,
         is_paused=job.is_paused,
         execution_timeout_seconds=job.execution_timeout_seconds,
+        max_retries=job.max_retries,
+        retry_delay_seconds=job.retry_delay_seconds,
         is_enabled=job.is_enabled,
         target_id=job.target_id,
         created_at=job.created_at,
