@@ -112,6 +112,9 @@ class ScheduledJob(Base):
     is_paused: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
+    execution_timeout_seconds: Mapped[float] = mapped_column(
+        Float, default=300.0, server_default="300", nullable=False
+    )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     target_id: Mapped[int | None] = mapped_column(
         ForeignKey("monitoring_targets.id", ondelete="SET NULL"),

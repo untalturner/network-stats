@@ -183,6 +183,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
             "schedule_type": "interval",
             "interval_seconds": 300,
             "timezone": "Europe/Madrid",
+            "execution_timeout_seconds": 45,
         },
     )
 
@@ -192,6 +193,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
     assert data["schedule_type"] == "interval"
     assert data["interval_seconds"] == 300
     assert data["timezone"] == "Europe/Madrid"
+    assert data["execution_timeout_seconds"] == 45
 
     dependency = app.dependency_overrides[get_db]
     db = next(dependency())
@@ -200,6 +202,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
         target = db.get(MonitoringTarget, target_id)
         assert job.schedule_is_customized is True
         assert job.interval_seconds == 300
+        assert job.execution_timeout_seconds == 45
         assert target.interval_seconds == 30
     finally:
         db.close()

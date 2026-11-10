@@ -36,6 +36,7 @@ type ScheduledJob = {
   schedule_is_customized: boolean;
   skip_next_run: boolean;
   is_paused: boolean;
+  execution_timeout_seconds: number;
   is_enabled: boolean;
   target_id: number | null;
   created_at: string;
@@ -56,6 +57,7 @@ type ScheduleDraft = {
   timezone: string;
   start_at: string;
   end_at: string;
+  execution_timeout_seconds: string;
   is_enabled: boolean;
 };
 
@@ -66,6 +68,7 @@ const emptyDraft: ScheduleDraft = {
   timezone: "UTC",
   start_at: "",
   end_at: "",
+  execution_timeout_seconds: "300",
   is_enabled: true,
 };
 
@@ -164,6 +167,7 @@ export default function SchedulesPage() {
       timezone: job.timezone || "UTC",
       start_at: toLocalDateTime(job.start_at),
       end_at: toLocalDateTime(job.end_at),
+      execution_timeout_seconds: String(job.execution_timeout_seconds),
       is_enabled: job.is_enabled,
     });
     setError("");
@@ -202,6 +206,7 @@ export default function SchedulesPage() {
       end_at: draft.end_at
         ? new Date(draft.end_at).toISOString()
         : null,
+      execution_timeout_seconds: Number(draft.execution_timeout_seconds),
       is_enabled: draft.is_enabled,
     };
 
@@ -533,6 +538,27 @@ export default function SchedulesPage() {
                           }
                           placeholder="Europe/Madrid"
                         />
+                      </label>
+
+                      <label>
+                        Job execution timeout (seconds)
+                        <input
+                          type="number"
+                          min={1}
+                          max={86400}
+                          step={1}
+                          required
+                          value={draft.execution_timeout_seconds}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              execution_timeout_seconds: event.target.value,
+                            })
+                          }
+                        />
+                        <span className="schedule-field-hint">
+                          Maximum time allowed for the entire job, not just an individual network probe.
+                        </span>
                       </label>
 
                       <label>

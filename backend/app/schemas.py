@@ -85,6 +85,7 @@ class ScheduledJobResponse(BaseModel):
     schedule_is_customized: bool
     skip_next_run: bool
     is_paused: bool
+    execution_timeout_seconds: float
     is_enabled: bool
     target_id: int | None
     created_at: datetime
@@ -101,6 +102,9 @@ class ScheduledJobScheduleUpdate(BaseModel):
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
     start_at: datetime | None = None
     end_at: datetime | None = None
+    execution_timeout_seconds: float = Field(
+        default=300.0, ge=1.0, le=86400.0
+    )
     is_enabled: bool | None = None
 
     @model_validator(mode="after")

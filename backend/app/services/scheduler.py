@@ -304,7 +304,16 @@ class MonitoringScheduler:
                     f"No handler registered for job type {job.job_type!r}"
                 )
 
-            await handler(db, job)
+            try:
+                await asyncio.wait_for(
+                    handler(db, job),
+                    timeout=float(job.execution_timeout_seconds),
+                )
+            except asyncio.TimeoutError as exc:
+                timeout_seconds = float(job.execution_timeout_seconds)
+                raise TimeoutError(
+                    f"Execution timed out after {timeout_seconds:g} seconds"
+                ) from exc
 
             self._finish_execution(db, execution_id, status="success")
 

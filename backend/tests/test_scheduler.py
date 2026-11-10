@@ -680,3 +680,60 @@ async def test_manual_run_is_allowed_while_job_is_paused(scheduler):
         execution = db.query(models.JobExecution).filter_by(job_id=job_id).one()
         assert job.is_paused is True
         assert execution.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_job_execution_timeout_cancels_handler_and_records_failure(scheduler):
+    import asyncio
+
+    cancelled = asyncio.Event()
+
+    async def slow_handler(db, job):
+        try:
+            await asyncio.sleep(5)
+        finally:
+            cancelled.set()
+
+    scheduler.register_handler("timeout_test", slow_handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Timeout test",
+            job_type="timeout_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            execution_timeout_seconds=0.05,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await scheduler._run_job(job_id)
+
+    assert cancelled.is_set()
+
+    with scheduler.session_factory() as db:
+        execution = (
+            db.query(models.JobExecution)
+            .filter_by(job_id=job_id)
+            .one()
+        )
+        assert execution.status == "failed"
+        assert execution.finished_at is not None
+        assert "timed out after 0.05 seconds" in execution.error
+
+
+def test_job_execution_timeout_defaults_to_five_minutes(scheduler):
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Default timeout test",
+            job_type="timeout_default_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        assert job.execution_timeout_seconds == 300.0
