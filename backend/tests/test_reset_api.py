@@ -120,3 +120,31 @@ def test_reset_clears_application_data_and_returns_backup_name(
     with client.app.state.testing_session_local() as db:
         for table in reversed(Base.metadata.sorted_tables):
             assert db.execute(table.select()).all() == []
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_releases_lifecycle_barrier(client, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.api.routes import reset_system
+
+    def fail_backup():
+        raise RuntimeError("Simulated backup failure")
+
+    monkeypatch.setattr("app.api.routes.create_database_backup", fail_backup)
+
+    with client.app.state.testing_session_local() as db:
+        with pytest.raises(HTTPException):
+            await reset_system(confirmation="RESET", db=db)
+        db.rollback()
+
+    exclusive_acquired = asyncio.Event()
+
+    async def probe():
+        async with monitoring_scheduler.lifecycle.exclusive():
+            exclusive_acquired.set()
+
+    await asyncio.wait_for(probe(), timeout=1)
+    assert exclusive_acquired.is_set() is True

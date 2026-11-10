@@ -259,6 +259,7 @@ def list_jobs(db: Session = Depends(get_db)):
                 execution_timeout_seconds=job.execution_timeout_seconds,
                 max_retries=job.max_retries,
                 retry_delay_seconds=job.retry_delay_seconds,
+                max_concurrent_runs=job.max_concurrent_runs,
                 is_enabled=job.is_enabled,
                 target_id=job.target_id,
                 created_at=job.created_at,
@@ -302,6 +303,7 @@ def update_job_schedule(
     job.execution_timeout_seconds = payload.execution_timeout_seconds
     job.max_retries = payload.max_retries
     job.retry_delay_seconds = payload.retry_delay_seconds
+    job.max_concurrent_runs = payload.max_concurrent_runs
     job.schedule_is_customized = True
 
     if payload.is_enabled is not None:
@@ -349,6 +351,7 @@ def update_job_schedule(
         execution_timeout_seconds=job.execution_timeout_seconds,
         max_retries=job.max_retries,
         retry_delay_seconds=job.retry_delay_seconds,
+        max_concurrent_runs=job.max_concurrent_runs,
         is_enabled=job.is_enabled,
         target_id=job.target_id,
         created_at=job.created_at,
@@ -1045,8 +1048,8 @@ async def reset_system(
             scheduler.pause()
             scheduler.remove_all_jobs()
 
-        async with monitoring_scheduler.execution_lock:
-            # Take the backup only after active scheduled probes have finished.
+        async with monitoring_scheduler.lifecycle.exclusive():
+            # Take the backup only after active scheduled executions have finished.
             backup_path = create_database_backup()
 
             # Preserve Alembic's migration history; clear application tables only.

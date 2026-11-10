@@ -188,6 +188,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
             "execution_timeout_seconds": 45,
             "max_retries": 2,
             "retry_delay_seconds": 4,
+            "max_concurrent_runs": 3,
         },
     )
 
@@ -200,6 +201,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
     assert data["execution_timeout_seconds"] == 45
     assert data["max_retries"] == 2
     assert data["retry_delay_seconds"] == 4
+    assert data["max_concurrent_runs"] == 3
 
     dependency = app.dependency_overrides[get_db]
     db = next(dependency())
@@ -211,6 +213,7 @@ def test_update_job_schedule_marks_schedule_customized(client):
         assert job.execution_timeout_seconds == 45
         assert job.max_retries == 2
         assert job.retry_delay_seconds == 4
+        assert job.max_concurrent_runs == 3
         assert target.interval_seconds == 30
     finally:
         db.close()
@@ -440,3 +443,20 @@ def test_resume_job_clears_paused_state(client):
 def test_pause_and_resume_return_404_for_missing_job(client):
     assert client.post("/api/v1/jobs/999/pause").status_code == 404
     assert client.post("/api/v1/jobs/999/resume").status_code == 404
+
+
+
+def test_update_job_schedule_rejects_concurrency_above_global_limit(client):
+    job_id, _ = create_job(client)
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/schedule",
+        json={
+            "schedule_type": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "max_concurrent_runs": 5,
+        },
+    )
+
+    assert response.status_code == 422

@@ -889,3 +889,390 @@ async def test_scheduler_start_recovers_interrupted_execution(scheduler):
 
     # A second recovery pass must not modify already recovered history.
     assert scheduler.recover_interrupted_executions() == 0
+
+
+@pytest.mark.asyncio
+async def test_independent_jobs_execute_concurrently(scheduler):
+    import asyncio
+
+    active = 0
+    peak_active = 0
+    both_started = asyncio.Event()
+
+    async def handler(db, job):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        if active >= 2:
+            both_started.set()
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+        finally:
+            active -= 1
+
+    scheduler.register_handler("parallel_jobs_test", handler)
+    job_ids = []
+    with scheduler.session_factory() as db:
+        for index in range(2):
+            job = models.ScheduledJob(
+                name=f"Parallel job {index}",
+                job_type="parallel_jobs_test",
+                schedule_type="interval",
+                interval_seconds=60,
+            )
+            db.add(job)
+            db.flush()
+            job_ids.append(job.id)
+        db.commit()
+
+    await asyncio.gather(*(scheduler._run_job(job_id) for job_id in job_ids))
+
+    assert peak_active == 2
+    with scheduler.session_factory() as db:
+        executions = (
+            db.query(models.JobExecution)
+            .filter(models.JobExecution.job_id.in_(job_ids))
+            .all()
+        )
+        assert len(executions) == 2
+        assert all(item.status == "success" for item in executions)
+
+
+@pytest.mark.asyncio
+async def test_same_job_defaults_to_one_concurrent_execution(scheduler):
+    import asyncio
+
+    active = 0
+    peak_active = 0
+
+    async def handler(db, job):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.04)
+        finally:
+            active -= 1
+
+    scheduler.register_handler("single_job_concurrency_test", handler)
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Single concurrency job",
+            job_type="single_job_concurrency_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await asyncio.gather(
+        scheduler._run_job(job_id, execution_kind="manual"),
+        scheduler._run_job(job_id, execution_kind="manual"),
+    )
+
+    assert peak_active == 1
+    with scheduler.session_factory() as db:
+        executions = db.query(models.JobExecution).filter_by(job_id=job_id).all()
+        assert len(executions) == 2
+        assert all(item.status == "success" for item in executions)
+
+
+@pytest.mark.asyncio
+async def test_same_job_can_use_configured_concurrency_limit(scheduler):
+    import asyncio
+
+    active = 0
+    peak_active = 0
+    both_started = asyncio.Event()
+
+    async def handler(db, job):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        if active >= 2:
+            both_started.set()
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+        finally:
+            active -= 1
+
+    scheduler.register_handler("multi_run_concurrency_test", handler)
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Concurrent job",
+            job_type="multi_run_concurrency_test",
+            schedule_type="interval",
+            interval_seconds=60,
+            max_concurrent_runs=2,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    await asyncio.gather(
+        scheduler._run_job(job_id, execution_kind="manual"),
+        scheduler._run_job(job_id, execution_kind="manual"),
+    )
+
+    assert peak_active == 2
+    with scheduler.session_factory() as db:
+        executions = db.query(models.JobExecution).filter_by(job_id=job_id).all()
+        assert len(executions) == 2
+        assert all(item.status == "success" for item in executions)
+
+
+@pytest.mark.asyncio
+async def test_global_concurrency_is_capped_at_four_jobs(scheduler):
+    import asyncio
+
+    active = 0
+    peak_active = 0
+    four_started = asyncio.Event()
+
+    async def handler(db, job):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        if active >= 4:
+            four_started.set()
+        try:
+            await asyncio.wait_for(four_started.wait(), timeout=1)
+        finally:
+            active -= 1
+
+    scheduler.register_handler("global_cap_test", handler)
+    job_ids = []
+    with scheduler.session_factory() as db:
+        for index in range(6):
+            job = models.ScheduledJob(
+                name=f"Global cap job {index}",
+                job_type="global_cap_test",
+                schedule_type="interval",
+                interval_seconds=60,
+            )
+            db.add(job)
+            db.flush()
+            job_ids.append(job.id)
+        db.commit()
+
+    await asyncio.gather(*(scheduler._run_job(job_id) for job_id in job_ids))
+
+    assert peak_active == 4
+    with scheduler.session_factory() as db:
+        executions = (
+            db.query(models.JobExecution)
+            .filter(models.JobExecution.job_id.in_(job_ids))
+            .all()
+        )
+        assert len(executions) == 6
+        assert all(item.status == "success" for item in executions)
+
+
+def test_reconcile_applies_per_job_concurrency_to_apscheduler(scheduler):
+    target_id = create_target(scheduler.session_factory, "Concurrency target")
+    scheduler.reconcile()
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.max_instances == 1
+
+    with scheduler.session_factory() as db:
+        job = db.query(models.ScheduledJob).filter_by(target_id=target_id).one()
+        job.max_concurrent_runs = 3
+        db.commit()
+
+    scheduler.reconcile()
+
+    runtime_job = scheduler.scheduler.get_job(f"target-{target_id}")
+    assert runtime_job is not None
+    assert runtime_job.max_instances == 3
+
+
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_active_execution_and_blocks_new_starts(scheduler):
+    import asyncio
+
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+    handler_finished = asyncio.Event()
+
+    async def blocking_handler(db, job):
+        handler_started.set()
+        await release_handler.wait()
+        handler_finished.set()
+
+    scheduler.register_handler("lifecycle_blocking_test", blocking_handler)
+
+    with scheduler.session_factory() as db:
+        active_job = models.ScheduledJob(
+            name="Active blocking job",
+            job_type="lifecycle_blocking_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(active_job)
+        db.commit()
+        db.refresh(active_job)
+        active_job_id = active_job.id
+
+    run_task = asyncio.create_task(scheduler._run_job(active_job_id))
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+    async def fast_handler(db, job):
+        return None
+
+    scheduler.register_handler("lifecycle_fast_test", fast_handler)
+    with scheduler.session_factory() as db:
+        new_job = models.ScheduledJob(
+            name="New job during reset",
+            job_type="lifecycle_fast_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(new_job)
+        db.commit()
+        db.refresh(new_job)
+        new_job_id = new_job.id
+
+    exclusive_acquired = asyncio.Event()
+    exclusive_released = asyncio.Event()
+
+    async def hold_exclusive():
+        async with scheduler.lifecycle.exclusive():
+            exclusive_acquired.set()
+        exclusive_released.set()
+
+    exclusive_task = asyncio.create_task(hold_exclusive())
+    await asyncio.sleep(0.05)
+    assert exclusive_acquired.is_set() is False
+
+    new_run_task = asyncio.create_task(scheduler._run_job(new_job_id))
+    await asyncio.sleep(0.05)
+    with scheduler.session_factory() as db:
+        assert db.query(models.JobExecution).filter_by(job_id=new_job_id).count() == 0
+
+    release_handler.set()
+    await asyncio.wait_for(run_task, timeout=1)
+    assert handler_finished.is_set() is True
+
+    await asyncio.wait_for(exclusive_acquired.wait(), timeout=1)
+    await asyncio.wait_for(exclusive_task, timeout=1)
+    assert exclusive_released.is_set() is True
+
+    await asyncio.wait_for(new_run_task, timeout=1)
+    with scheduler.session_factory() as db:
+        assert db.query(models.JobExecution).filter_by(job_id=new_job_id).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_run_target_uses_same_concurrency_controls(scheduler):
+    import asyncio
+
+    active = 0
+    peak_active = 0
+    both_started = asyncio.Event()
+
+    result = ProbeResult(
+        target="1.1.1.1",
+        protocol="icmp",
+        is_available=True,
+        latency_ms=10.0,
+        packet_loss_percent=0.0,
+        measured_at=datetime(2026, 11, 5, 20, 0, 0),
+        error=None,
+    )
+
+    async def slow_probe(*args, **kwargs):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        if active >= 2:
+            both_started.set()
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            return result
+        finally:
+            active -= 1
+
+    target_ids = [
+        create_target(scheduler.session_factory, f"Run target concurrency {i}")
+        for i in range(2)
+    ]
+
+    from unittest.mock import patch
+
+    with patch(
+        "app.services.monitoring.probe_target",
+        new=slow_probe,
+    ):
+        await asyncio.gather(
+            *(scheduler._run_target(target_id) for target_id in target_ids)
+        )
+
+    assert peak_active == 2
+    with scheduler.session_factory() as db:
+        assert db.query(models.Measurement).count() == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_execution_releases_lifecycle_and_concurrency_gates(scheduler):
+    import asyncio
+
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def blocking_handler(db, job):
+        handler_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    scheduler.register_handler("cancel_release_test", blocking_handler)
+
+    with scheduler.session_factory() as db:
+        job = models.ScheduledJob(
+            name="Cancel release test",
+            job_type="cancel_release_test",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    task = asyncio.create_task(scheduler._run_job(job_id))
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert handler_cancelled.is_set() is True
+
+    exclusive_acquired = asyncio.Event()
+
+    async def probe_exclusive():
+        async with scheduler.lifecycle.exclusive():
+            exclusive_acquired.set()
+
+    await asyncio.wait_for(probe_exclusive(), timeout=1)
+    assert exclusive_acquired.is_set() is True
+
+    # Job concurrency gate must be free for a subsequent run.
+    quick_ran = asyncio.Event()
+
+    async def quick_handler(db, job):
+        quick_ran.set()
+
+    scheduler.job_handlers["cancel_release_test"] = quick_handler
+    await asyncio.wait_for(scheduler._run_job(job_id), timeout=1)
+    assert quick_ran.is_set() is True
+
+    # Global semaphore must also be available.
+    assert scheduler.execution_semaphore._value == scheduler.max_global_concurrency

@@ -121,6 +121,9 @@ class ScheduledJob(Base):
     retry_delay_seconds: Mapped[float] = mapped_column(
         Float, default=5.0, server_default="5", nullable=False
     )
+    max_concurrent_runs: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     target_id: Mapped[int | None] = mapped_column(
         ForeignKey("monitoring_targets.id", ondelete="SET NULL"),

@@ -90,6 +90,7 @@ class ScheduledJobResponse(BaseModel):
     execution_timeout_seconds: float
     max_retries: int
     retry_delay_seconds: float
+    max_concurrent_runs: int
     is_enabled: bool
     target_id: int | None
     created_at: datetime
@@ -111,6 +112,7 @@ class ScheduledJobScheduleUpdate(BaseModel):
     )
     max_retries: int = Field(default=0, ge=0, le=10)
     retry_delay_seconds: float = Field(default=5.0, ge=1.0, le=3600.0)
+    max_concurrent_runs: int = Field(default=1, ge=1, le=4)
     is_enabled: bool | None = None
 
     @model_validator(mode="after")

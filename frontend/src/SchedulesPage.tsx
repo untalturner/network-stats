@@ -41,6 +41,7 @@ type ScheduledJob = {
   execution_timeout_seconds: number;
   max_retries: number;
   retry_delay_seconds: number;
+  max_concurrent_runs: number;
   is_enabled: boolean;
   target_id: number | null;
   created_at: string;
@@ -64,6 +65,7 @@ type ScheduleDraft = {
   execution_timeout_seconds: string;
   max_retries: string;
   retry_delay_seconds: string;
+  max_concurrent_runs: string;
   is_enabled: boolean;
 };
 
@@ -77,6 +79,7 @@ const emptyDraft: ScheduleDraft = {
   execution_timeout_seconds: "300",
   max_retries: "0",
   retry_delay_seconds: "5",
+  max_concurrent_runs: "1",
   is_enabled: true,
 };
 
@@ -178,6 +181,7 @@ export default function SchedulesPage() {
       execution_timeout_seconds: String(job.execution_timeout_seconds),
       max_retries: String(job.max_retries),
       retry_delay_seconds: String(job.retry_delay_seconds),
+      max_concurrent_runs: String(job.max_concurrent_runs),
       is_enabled: job.is_enabled,
     });
     setError("");
@@ -219,6 +223,7 @@ export default function SchedulesPage() {
       execution_timeout_seconds: Number(draft.execution_timeout_seconds),
       max_retries: Number(draft.max_retries),
       retry_delay_seconds: Number(draft.retry_delay_seconds),
+      max_concurrent_runs: Number(draft.max_concurrent_runs),
       is_enabled: draft.is_enabled,
     };
 
@@ -398,6 +403,7 @@ export default function SchedulesPage() {
                   <div className="schedule-details">
                     <div><span>Schedule</span><strong>{scheduleDescription(job)}</strong></div>
                     <div><span>Timezone</span><strong>{job.timezone}</strong></div>
+                    <div><span>Concurrency</span><strong>{job.max_concurrent_runs} max runs</strong></div>
                     <div><span>Next run</span><strong>{formatDate(schedulerJob?.next_run_at)}</strong></div>
                     <div><span>Last execution</span><strong>{formatDate(job.latest_execution?.started_at)}</strong></div>
                     <div>
@@ -607,6 +613,27 @@ export default function SchedulesPage() {
                             })
                           }
                         />
+                      </label>
+
+                      <label>
+                        Maximum concurrent executions for this job
+                        <input
+                          type="number"
+                          min={1}
+                          max={4}
+                          step={1}
+                          required
+                          value={draft.max_concurrent_runs}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              max_concurrent_runs: event.target.value,
+                            })
+                          }
+                        />
+                        <span className="schedule-field-hint">
+                          A limit of 1 runs this job sequentially. The NAS runs at most 4 jobs at once across the whole scheduler.
+                        </span>
                       </label>
 
                       <label>

@@ -1,7 +1,8 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,14 +26,91 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+class JobConcurrencyGate:
+    """Dynamically adjustable per-job execution concurrency gate."""
+
+    def __init__(self, limit: int = 1):
+        self.limit = limit
+        self.active = 0
+        self.condition = asyncio.Condition()
+
+    async def acquire(self, limit: int) -> None:
+        async with self.condition:
+            self.limit = limit
+            await self.condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+
+    async def release(self) -> None:
+        async with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+
+class ExecutionLifecycleCoordinator:
+    """Coordinates normal executions with exclusive reset operations.
+
+    New executions are blocked while a reset is active or waiting. Reset waits
+    for all currently active executions to finish and is serialized against
+    other resets. Registrations are always released on exit or cancellation.
+    """
+
+    def __init__(self):
+        self._condition = asyncio.Condition()
+        self._active_executions = 0
+        self._reset_active = False
+        self._reset_waiters = 0
+
+    @asynccontextmanager
+    async def execution(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._reset_active and self._reset_waiters == 0
+            )
+            self._active_executions += 1
+
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._active_executions -= 1
+                self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        async with self._condition:
+            self._reset_waiters += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: not self._reset_active and self._active_executions == 0
+                )
+                self._reset_active = True
+            finally:
+                self._reset_waiters -= 1
+                self._condition.notify_all()
+
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._reset_active = False
+                self._condition.notify_all()
+
+
 class MonitoringScheduler:
     def __init__(
         self,
         session_factory: SessionFactory = SessionLocal,
+        max_global_concurrency: int = 4,
     ):
+        if max_global_concurrency < 1:
+            raise ValueError("Global concurrency must be at least 1")
+
         self.session_factory = session_factory
         self.scheduler = AsyncIOScheduler(timezone="UTC")
-        self.execution_lock = asyncio.Lock()
+        self.lifecycle = ExecutionLifecycleCoordinator()
+        self.max_global_concurrency = max_global_concurrency
+        self.execution_semaphore = asyncio.Semaphore(max_global_concurrency)
+        self._job_concurrency_gates: dict[int, JobConcurrencyGate] = {}
         self.job_handlers: dict[str, JobHandler] = {}
         self._manual_run_ids: set[int] = set()
 
@@ -208,9 +286,31 @@ class MonitoringScheduler:
         scheduled_job_id: int,
         execution_kind: str = "scheduled",
     ) -> None:
-        """Execute any persisted job using its registered handler."""
-        async with self.execution_lock:
-            await self._run_job_locked(scheduled_job_id, execution_kind)
+        """Execute a job within lifecycle, global and per-job concurrency limits."""
+        async with self.lifecycle.execution():
+            db = self.session_factory()
+            try:
+                job = db.get(ScheduledJob, scheduled_job_id)
+                if job is None:
+                    logger.warning(
+                        "Cannot execute scheduled job %s: job not found",
+                        scheduled_job_id,
+                    )
+                    return
+                concurrency_limit = int(job.max_concurrent_runs)
+            finally:
+                db.close()
+
+            gate = self._job_concurrency_gates.setdefault(
+                scheduled_job_id,
+                JobConcurrencyGate(concurrency_limit),
+            )
+            await gate.acquire(concurrency_limit)
+            try:
+                async with self.execution_semaphore:
+                    await self._run_job_locked(scheduled_job_id, execution_kind)
+            finally:
+                await gate.release()
 
     async def _run_job_locked(
         self,
@@ -415,55 +515,60 @@ class MonitoringScheduler:
         target_id: int,
         scheduled_job_id: int | None = None,
     ) -> None:
-        """Compatibility wrapper for existing target-based callers."""
-        async with self.execution_lock:
-            await self._run_target_locked(target_id, scheduled_job_id)
+        """Compatibility wrapper for existing target-based callers.
 
-    async def _run_target_locked(
-        self,
-        target_id: int,
-        scheduled_job_id: int | None = None,
-    ) -> None:
-        """Compatibility path for existing target-based callers."""
-        db = self.session_factory()
-
-        try:
-            job = (
-                db.get(ScheduledJob, scheduled_job_id)
-                if scheduled_job_id is not None
-                else db.scalar(
-                    select(ScheduledJob).where(
-                        ScheduledJob.target_id == target_id
+        Uses the same lifecycle coordinator and concurrency controls as
+        scheduled job executions.
+        """
+        async with self.lifecycle.execution():
+            db = self.session_factory()
+            try:
+                job = (
+                    db.get(ScheduledJob, scheduled_job_id)
+                    if scheduled_job_id is not None
+                    else db.scalar(
+                        select(ScheduledJob).where(
+                            ScheduledJob.target_id == target_id
+                        )
                     )
                 )
-            )
 
-            target = db.get(MonitoringTarget, target_id)
+                target = db.get(MonitoringTarget, target_id)
 
-            if job is None and target is not None:
-                job = ScheduledJob(
-                    name=f"Probe target: {target.name}",
-                    job_type="connectivity_probe",
-                    interval_seconds=target.interval_seconds,
-                    is_enabled=target.is_enabled,
-                    target_id=target.id,
+                if job is None and target is not None:
+                    job = ScheduledJob(
+                        name=f"Probe target: {target.name}",
+                        job_type="connectivity_probe",
+                        interval_seconds=target.interval_seconds,
+                        is_enabled=target.is_enabled,
+                        target_id=target.id,
+                    )
+                    db.add(job)
+                    db.commit()
+                    db.refresh(job)
+
+                if job is None:
+                    logger.warning(
+                        "Cannot record execution for target %s: "
+                        "scheduled job not found",
+                        target_id,
+                    )
+                    return
+
+                concurrency_limit = int(job.max_concurrent_runs)
+                gate = self._job_concurrency_gates.setdefault(
+                    job.id,
+                    JobConcurrencyGate(concurrency_limit),
                 )
-                db.add(job)
-                db.commit()
-                db.refresh(job)
 
-            if job is None:
-                logger.warning(
-                    "Cannot record execution for target %s: "
-                    "scheduled job not found",
-                    target_id,
-                )
-                return
-
-            await self._execute_job(db, job)
-
-        finally:
-            db.close()
+                await gate.acquire(concurrency_limit)
+                try:
+                    async with self.execution_semaphore:
+                        await self._execute_job(db, job)
+                finally:
+                    await gate.release()
+            finally:
+                db.close()
 
     @staticmethod
     def _finish_execution(
@@ -542,6 +647,7 @@ class MonitoringScheduler:
                         not job.schedule_is_customized
                         and job.schedule_type == "interval"
                     ),
+                    job.max_concurrent_runs,
                 )
                 for job in persistent_jobs
                 if (
@@ -569,6 +675,7 @@ class MonitoringScheduler:
             persistent_job_id,
             trigger,
             run_immediately,
+            max_concurrent_runs,
         ) in desired_jobs.items():
             job_id = f"target-{target_id}"
             existing_job = self.scheduler.get_job(job_id)
@@ -578,6 +685,7 @@ class MonitoringScheduler:
                     self._trigger_signature(existing_job.trigger)
                     == self._trigger_signature(trigger)
                     and existing_job.args == [persistent_job_id, "scheduled"]
+                    and existing_job.max_instances == max_concurrent_runs
                 ):
                     continue
 
@@ -600,7 +708,7 @@ class MonitoringScheduler:
                         datetime.now(trigger.timezone),
                     )
                 ),
-                max_instances=1,
+                max_instances=max_concurrent_runs,
                 coalesce=True,
                 misfire_grace_time=30,
             )
